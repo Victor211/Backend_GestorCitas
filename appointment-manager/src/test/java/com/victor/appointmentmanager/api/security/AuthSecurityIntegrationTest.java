@@ -33,7 +33,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @TestPropertySource(properties = {
         "spring.jpa.hibernate.ddl-auto=create-drop",
         "app.jwt.secret=test-only-dummy-secret-never-used-in-production-0123456789",
-        "app.jwt.expiration=3600000"
+        "app.jwt.expiration=3600000",
+        "app.openai.api-key=test-key"
 })
 class AuthSecurityIntegrationTest {
 
