@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: appointment-manager
+  profiles:
+    active: dev
+  mandatory-file-encoding: UTF-8
+  jackson:
+    time-zone: UTC
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+
+server:
+  port: 8080
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+
+# app.jwt.expiration se expresa en MILISEGUNDOS (una sola unidad, consistente en todo el proyecto).
+app:
+  jwt:
+    secret: ${JWT_SECRET}
+    expiration: ${JWT_EXPIRATION}
