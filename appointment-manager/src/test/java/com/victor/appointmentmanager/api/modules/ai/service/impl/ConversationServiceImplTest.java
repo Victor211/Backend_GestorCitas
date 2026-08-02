@@ -29,6 +29,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 
 import java.util.List;
 import java.util.Optional;
@@ -38,7 +39,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -178,8 +178,8 @@ class ConversationServiceImplTest {
                 "INTENT: CANCEL_APPOINTMENT\nCONFIDENCE: 0.7\nREPLY: Listo, cancelé tu turno.");
         when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
                 .thenReturn(Optional.of(customer));
-        when(appointmentRepository.search(eq(1L), isNull(), eq(2L), eq(AppointmentStatus.CONFIRMED),
-                any(), isNull(), any())).thenReturn(new PageImpl<>(List.of(appointment)));
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(appointment)));
 
         AppointmentResponse appointmentResponse = new AppointmentResponse();
         appointmentResponse.setId(100L);

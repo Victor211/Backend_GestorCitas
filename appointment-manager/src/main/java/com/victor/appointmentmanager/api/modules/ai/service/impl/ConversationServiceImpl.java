@@ -13,6 +13,7 @@ import com.victor.appointmentmanager.api.modules.appointments.entity.Appointment
 import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentStatus;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
+import com.victor.appointmentmanager.api.modules.appointments.specification.AppointmentSpecifications;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
 import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
@@ -29,6 +30,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
@@ -159,8 +161,9 @@ public class ConversationServiceImpl implements ConversationService {
         }
 
         Pageable pageable = PageRequest.of(0, 1, Sort.by(Sort.Direction.ASC, "startAt"));
-        Page<Appointment> page = appointmentRepository.search(business.getId(), null, customer.get().getId(),
-                AppointmentStatus.CONFIRMED, Instant.now(), null, pageable);
+        Specification<Appointment> specification = AppointmentSpecifications.filterBy(
+                business.getId(), null, customer.get().getId(), AppointmentStatus.CONFIRMED, Instant.now(), null);
+        Page<Appointment> page = appointmentRepository.findAll(specification, pageable);
 
         return page.getContent().stream().findFirst().map(Appointment::getId);
     }

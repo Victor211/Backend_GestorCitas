@@ -11,6 +11,7 @@ import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentS
 import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotFoundException;
 import com.victor.appointmentmanager.api.modules.appointments.mapper.AppointmentMapper;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
+import com.victor.appointmentmanager.api.modules.appointments.specification.AppointmentSpecifications;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.exception.CustomerNotFoundException;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
@@ -26,6 +27,7 @@ import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -33,6 +35,10 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.time.DayOfWeek;
@@ -49,8 +55,6 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -565,19 +569,178 @@ class AppointmentServiceImplTest {
     }
 
     @Test
-    void listsAppointmentsPaginatedWithFilters() {
+    void listsAppointmentsWithoutFilters() {
         Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
-        Pageable pageable = PageRequest.of(0, 10);
+        Pageable pageable = PageRequest.of(0, 10, Sort.by(Sort.Direction.ASC, "startAt"));
         Page<Appointment> page = new PageImpl<>(List.of(appointment), pageable, 1);
 
-        when(appointmentRepository.search(eq(1L), eq(3L), isNull(), eq(AppointmentStatus.CONFIRMED),
-                any(), any(), eq(pageable))).thenReturn(page);
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
         when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
 
         Page<AppointmentResponse> result = appointmentService.findAll(
-                3L, null, AppointmentStatus.CONFIRMED, startAt, endAt, pageable);
+                null, null, null, null, null, PageRequest.of(0, 10));
 
         assertThat(result.getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    void listsAppointmentsFilteredByEmployeeId() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        Page<AppointmentResponse> result = appointmentService.findAll(
+                3L, null, null, null, null, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        verify(appointmentRepository).findAll(any(Specification.class), any(Pageable.class));
+    }
+
+    @Test
+    void listsAppointmentsFilteredByCustomerId() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        Page<AppointmentResponse> result = appointmentService.findAll(
+                null, 2L, null, null, null, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    void listsAppointmentsFilteredByStatus() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        Page<AppointmentResponse> result = appointmentService.findAll(
+                null, null, AppointmentStatus.CONFIRMED, null, null, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    void listsAppointmentsFilteredOnlyByFrom() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        Page<AppointmentResponse> result = appointmentService.findAll(
+                null, null, null, startAt, null, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    void listsAppointmentsFilteredOnlyByTo() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        Page<AppointmentResponse> result = appointmentService.findAll(
+                null, null, null, null, endAt, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    void listsAppointmentsFilteredByFromAndTo() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        Page<AppointmentResponse> result = appointmentService.findAll(
+                null, null, null, startAt, endAt, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    void listsAppointmentsWithMultipleCombinedFilters() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        Page<AppointmentResponse> result = appointmentService.findAll(
+                3L, 2L, AppointmentStatus.CONFIRMED, startAt, endAt, PageRequest.of(0, 10));
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    void throwsBadRequestWhenFromIsAfterTo() {
+        assertThatThrownBy(() -> appointmentService.findAll(
+                null, null, null, endAt, startAt, PageRequest.of(0, 10)))
+                .isInstanceOf(ResponseStatusException.class)
+                .extracting(ex -> ((ResponseStatusException) ex).getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verify(appointmentRepository, never()).findAll(any(Specification.class), any(Pageable.class));
+    }
+
+    @Test
+    void listingAlwaysScopesSpecificationToAuthenticatedBusiness() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        appointmentService.findAll(null, null, null, null, null, PageRequest.of(0, 10));
+
+        verify(currentUserProvider).getCurrentBusinessId();
+    }
+
+    @Test
+    void appliesDefaultSortByStartAtAscendingWhenPageableHasNoSort() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        appointmentService.findAll(null, null, null, null, null, PageRequest.of(0, 10));
+
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        verify(appointmentRepository).findAll(any(Specification.class), pageableCaptor.capture());
+
+        Sort.Order order = pageableCaptor.getValue().getSort().getOrderFor("startAt");
+        assertThat(order).isNotNull();
+        assertThat(order.getDirection()).isEqualTo(Sort.Direction.ASC);
+    }
+
+    @Test
+    void preservesExplicitSortWhenPageableAlreadyHasOne() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Page<Appointment> page = new PageImpl<>(List.of(appointment));
+        Pageable requestedPageable = PageRequest.of(0, 10, Sort.by(Sort.Direction.DESC, "startAt"));
+
+        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class))).thenReturn(page);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        appointmentService.findAll(null, null, null, null, null, requestedPageable);
+
+        ArgumentCaptor<Pageable> pageableCaptor = ArgumentCaptor.forClass(Pageable.class);
+        verify(appointmentRepository).findAll(any(Specification.class), pageableCaptor.capture());
+
+        Sort.Order order = pageableCaptor.getValue().getSort().getOrderFor("startAt");
+        assertThat(order).isNotNull();
+        assertThat(order.getDirection()).isEqualTo(Sort.Direction.DESC);
     }
 
     private Appointment existingAppointment(AppointmentStatus status) {

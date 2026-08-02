@@ -12,6 +12,7 @@ import com.victor.appointmentmanager.api.modules.appointments.exception.Appointm
 import com.victor.appointmentmanager.api.modules.appointments.mapper.AppointmentMapper;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
+import com.victor.appointmentmanager.api.modules.appointments.specification.AppointmentSpecifications;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.exception.CustomerNotFoundException;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
@@ -26,8 +27,13 @@ import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.http.HttpStatus;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.time.DateTimeException;
 import java.time.DayOfWeek;
@@ -99,8 +105,10 @@ public class AppointmentServiceImpl implements AppointmentService {
                                               Pageable pageable) {
         assertValidDateRange(from, to);
 
-        return appointmentRepository.search(currentUserProvider.getCurrentBusinessId(), employeeId, customerId,
-                        status, from, to, pageable)
+        Specification<Appointment> specification = AppointmentSpecifications.filterBy(
+                currentUserProvider.getCurrentBusinessId(), employeeId, customerId, status, from, to);
+
+        return appointmentRepository.findAll(specification, withDefaultSort(pageable))
                 .map(appointmentMapper::toDto);
     }
 
@@ -256,8 +264,17 @@ public class AppointmentServiceImpl implements AppointmentService {
 
     private void assertValidDateRange(Instant from, Instant to) {
         if (from != null && to != null && from.isAfter(to)) {
-            throw new BusinessException("El rango de fechas no es válido: 'from' debe ser anterior o igual a 'to'");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "El rango de fechas no es válido: 'from' debe ser anterior o igual a 'to'");
         }
+    }
+
+    private Pageable withDefaultSort(Pageable pageable) {
+        if (pageable.getSort().isUnsorted()) {
+            return PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(),
+                    Sort.by(Sort.Direction.ASC, "startAt"));
+        }
+        return pageable;
     }
 
 }
