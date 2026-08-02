@@ -9,7 +9,6 @@ import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
 import com.victor.appointmentmanager.api.modules.employees.mapper.EmployeeMapper;
 import com.victor.appointmentmanager.api.modules.employees.repository.EmployeeRepository;
 import com.victor.appointmentmanager.api.modules.employees.service.EmployeeService;
-import com.victor.appointmentmanager.api.security.BusinessAccessValidator;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
@@ -26,15 +25,14 @@ public class EmployeeServiceImpl implements EmployeeService {
     private final EmployeeRepository employeeRepository;
     private final BusinessRepository businessRepository;
     private final EmployeeMapper employeeMapper;
-    private final BusinessAccessValidator businessAccessValidator;
     private final CurrentUserProvider currentUserProvider;
 
     @Override
     @Transactional
     public EmployeeResponse create(CreateEmployeeRequest request) {
-        businessAccessValidator.validate(request.getBusinessId());
-        assertPhoneIsAvailable(request.getPhone());
-        Business business = findActiveBusinessOrThrow(request.getBusinessId());
+        Long businessId = currentUserProvider.getCurrentBusinessId();
+        Business business = findActiveBusinessOrThrow(businessId);
+        assertPhoneIsAvailable(request.getPhone(), businessId);
 
         Employee employee = employeeMapper.toEntity(request);
         employee.setBusiness(business);
@@ -46,17 +44,14 @@ public class EmployeeServiceImpl implements EmployeeService {
     @Override
     @Transactional
     public EmployeeResponse update(Long id, UpdateEmployeeRequest request) {
-        businessAccessValidator.validate(request.getBusinessId());
-        Employee employee = findOwnedByIdOrThrow(id);
+        Long businessId = currentUserProvider.getCurrentBusinessId();
+        Employee employee = findOwnedByIdOrThrow(id, businessId);
 
         if (!employee.getPhone().equals(request.getPhone())) {
-            assertPhoneIsAvailable(request.getPhone());
+            assertPhoneIsAvailable(request.getPhone(), businessId);
         }
 
-        Business business = findActiveBusinessOrThrow(request.getBusinessId());
-
         employeeMapper.updateEntityFromRequest(request, employee);
-        employee.setBusiness(business);
 
         Employee updated = employeeRepository.save(employee);
         return employeeMapper.toDto(updated);
@@ -65,7 +60,7 @@ public class EmployeeServiceImpl implements EmployeeService {
     @Override
     @Transactional(readOnly = true)
     public EmployeeResponse findById(Long id) {
-        return employeeMapper.toDto(findOwnedByIdOrThrow(id));
+        return employeeMapper.toDto(findOwnedByIdOrThrow(id, currentUserProvider.getCurrentBusinessId()));
     }
 
     @Override
@@ -80,13 +75,13 @@ public class EmployeeServiceImpl implements EmployeeService {
     @Override
     @Transactional
     public void delete(Long id) {
-        Employee employee = findOwnedByIdOrThrow(id);
+        Employee employee = findOwnedByIdOrThrow(id, currentUserProvider.getCurrentBusinessId());
         employee.setActive(false);
         employeeRepository.save(employee);
     }
 
-    private Employee findOwnedByIdOrThrow(Long id) {
-        return employeeRepository.findByIdAndBusinessIdAndActiveTrue(id, currentUserProvider.getCurrentBusinessId())
+    private Employee findOwnedByIdOrThrow(Long id, Long businessId) {
+        return employeeRepository.findByIdAndBusinessIdAndActiveTrue(id, businessId)
                 .orElseThrow(() -> new ResourceNotFoundException("Empleado no encontrado con id " + id));
     }
 
@@ -95,8 +90,8 @@ public class EmployeeServiceImpl implements EmployeeService {
                 .orElseThrow(() -> new ResourceNotFoundException("Negocio no encontrado con id " + businessId));
     }
 
-    private void assertPhoneIsAvailable(String phone) {
-        if (employeeRepository.existsByPhone(phone)) {
+    private void assertPhoneIsAvailable(String phone, Long businessId) {
+        if (employeeRepository.existsByPhoneAndBusinessId(phone, businessId)) {
             throw new BusinessException("Ya existe un empleado con el teléfono '" + phone + "'");
         }
     }

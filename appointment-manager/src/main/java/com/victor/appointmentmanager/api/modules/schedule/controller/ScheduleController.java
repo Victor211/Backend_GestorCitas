@@ -92,14 +92,11 @@ public class ScheduleController {
     }
 
     @GetMapping
-    @Operation(summary = "Listar los horarios activos de los empleados de un negocio, "
+    @Operation(summary = "Listar los horarios activos de los empleados del negocio autenticado, "
             + "opcionalmente filtrados por empleado y/o día de la semana")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Listado obtenido correctamente"),
-            @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "businessId es obligatorio",
-                    content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "404", description = "Negocio no encontrado",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
@@ -108,14 +105,12 @@ public class ScheduleController {
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
     public ApiResponse<List<ScheduleResponse>> findAllByBusiness(
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId,
             @Parameter(description = "Id del empleado (opcional)")
             @RequestParam(required = false) Long employeeId,
             @Parameter(description = "Día de la semana (opcional). Valores válidos de java.time.DayOfWeek: "
                     + "MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY")
             @RequestParam(required = false) DayOfWeek dayOfWeek) {
-        return ResponseFactory.success(scheduleService.findAllByBusiness(businessId, employeeId, dayOfWeek));
+        return ResponseFactory.success(scheduleService.findAllByBusiness(employeeId, dayOfWeek));
     }
 
     @PutMapping("/{id}")

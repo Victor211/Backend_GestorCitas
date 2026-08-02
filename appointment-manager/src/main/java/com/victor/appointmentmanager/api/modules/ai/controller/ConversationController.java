@@ -50,7 +50,7 @@ public class ConversationController {
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
     public ApiResponse<ConversationResponse> conversation(@Valid @RequestBody ConversationRequest request) {
-        return ResponseFactory.success(conversationService.handleMessage(request));
+        return ResponseFactory.success(conversationService.processAuthenticatedConversation(request));
     }
 
 }

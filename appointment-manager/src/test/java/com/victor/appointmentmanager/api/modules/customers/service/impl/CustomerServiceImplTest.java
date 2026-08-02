@@ -8,7 +8,6 @@ import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.exception.CustomerNotFoundException;
 import com.victor.appointmentmanager.api.modules.customers.mapper.CustomerMapper;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
-import com.victor.appointmentmanager.api.security.BusinessAccessValidator;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
@@ -18,7 +17,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.util.Optional;
 
@@ -42,9 +40,6 @@ class CustomerServiceImplTest {
 
     @Mock
     private CustomerMapper customerMapper;
-
-    @Mock
-    private BusinessAccessValidator businessAccessValidator;
 
     @Mock
     private CurrentUserProvider currentUserProvider;
@@ -78,7 +73,6 @@ class CustomerServiceImplTest {
         request.setFirstName("Ana");
         request.setLastName("Gómez");
         request.setPhone("0981000000");
-        request.setBusinessId(1L);
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
         when(customerRepository.existsByBusinessIdAndPhone(1L, "0981000000")).thenReturn(false);
@@ -94,14 +88,12 @@ class CustomerServiceImplTest {
         assertThat(result.getId()).isEqualTo(10L);
         assertThat(customer.getBusiness()).isEqualTo(business);
         verify(customerRepository).save(customer);
-        verify(businessAccessValidator).validate(1L);
     }
 
     @Test
     void throwsBusinessExceptionWhenPhoneAlreadyExistsInBusinessOnCreate() {
         CreateCustomerRequest request = new CreateCustomerRequest();
         request.setPhone("0981000000");
-        request.setBusinessId(1L);
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
         when(customerRepository.existsByBusinessIdAndPhone(1L, "0981000000")).thenReturn(true);
@@ -173,10 +165,9 @@ class CustomerServiceImplTest {
         response.setId(10L);
         when(customerMapper.toDto(customer)).thenReturn(response);
 
-        CustomerResponse result = customerService.findByPhone(1L, "0981000000");
+        CustomerResponse result = customerService.findByPhone("0981000000");
 
         assertThat(result.getId()).isEqualTo(10L);
-        verify(businessAccessValidator).validate(1L);
     }
 
     @Test
@@ -184,14 +175,16 @@ class CustomerServiceImplTest {
         when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "0000000000"))
                 .thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> customerService.findByPhone(1L, "0000000000"))
+        assertThatThrownBy(() -> customerService.findByPhone("0000000000"))
                 .isInstanceOf(CustomerNotFoundException.class);
     }
 
     @Test
-    void throwsBadRequestWhenBusinessIdMissingOnFindByPhone() {
-        assertThatThrownBy(() -> customerService.findByPhone(null, "0981000000"))
-                .isInstanceOf(ResponseStatusException.class);
+    void doesNotExposeCustomerFromAnotherBusinessOnFindById() {
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(10L, 1L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> customerService.findById(10L))
+                .isInstanceOf(CustomerNotFoundException.class);
     }
 
 }

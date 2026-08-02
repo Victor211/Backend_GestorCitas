@@ -12,14 +12,11 @@ import com.victor.appointmentmanager.api.modules.schedule.exception.ScheduleNotF
 import com.victor.appointmentmanager.api.modules.schedule.mapper.ScheduleMapper;
 import com.victor.appointmentmanager.api.modules.schedule.repository.ScheduleRepository;
 import com.victor.appointmentmanager.api.modules.schedule.service.ScheduleService;
-import com.victor.appointmentmanager.api.security.BusinessAccessValidator;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.time.DayOfWeek;
 import java.time.LocalTime;
@@ -33,14 +30,13 @@ public class ScheduleServiceImpl implements ScheduleService {
     private final EmployeeRepository employeeRepository;
     private final BusinessRepository businessRepository;
     private final ScheduleMapper scheduleMapper;
-    private final BusinessAccessValidator businessAccessValidator;
     private final CurrentUserProvider currentUserProvider;
 
     @Override
     @Transactional
     public ScheduleResponse create(CreateScheduleRequest request) {
-        Employee employee = findActiveEmployeeOrThrow(request.getEmployeeId());
-        businessAccessValidator.validate(employee.getBusiness().getId());
+        Long businessId = currentUserProvider.getCurrentBusinessId();
+        Employee employee = findOwnedEmployeeOrThrow(request.getEmployeeId(), businessId);
         assertValidInterval(request.getStartTime(), request.getEndTime());
         assertNoOverlap(employee.getId(), request.getDayOfWeek(), request.getStartTime(), request.getEndTime(), null);
 
@@ -75,8 +71,8 @@ public class ScheduleServiceImpl implements ScheduleService {
     @Override
     @Transactional(readOnly = true)
     public List<ScheduleResponse> findAllByEmployee(Long employeeId) {
-        Employee employee = findActiveEmployeeOrThrow(employeeId);
-        businessAccessValidator.validate(employee.getBusiness().getId());
+        Long businessId = currentUserProvider.getCurrentBusinessId();
+        findOwnedEmployeeOrThrow(employeeId, businessId);
 
         return scheduleRepository.findByEmployeeIdAndActiveTrueOrderByDayOfWeekAscStartTimeAsc(employeeId)
                 .stream()
@@ -86,11 +82,8 @@ public class ScheduleServiceImpl implements ScheduleService {
 
     @Override
     @Transactional(readOnly = true)
-    public List<ScheduleResponse> findAllByBusiness(Long businessId, Long employeeId, DayOfWeek dayOfWeek) {
-        if (businessId == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "businessId es obligatorio");
-        }
-        businessAccessValidator.validate(businessId);
+    public List<ScheduleResponse> findAllByBusiness(Long employeeId, DayOfWeek dayOfWeek) {
+        Long businessId = currentUserProvider.getCurrentBusinessId();
 
         businessRepository.findByIdAndActiveTrue(businessId)
                 .orElseThrow(() -> new ResourceNotFoundException("Negocio no encontrado con id " + businessId));
@@ -114,8 +107,8 @@ public class ScheduleServiceImpl implements ScheduleService {
                 .orElseThrow(() -> new ScheduleNotFoundException("Horario no encontrado con id " + id));
     }
 
-    private Employee findActiveEmployeeOrThrow(Long employeeId) {
-        return employeeRepository.findByIdAndActiveTrue(employeeId)
+    private Employee findOwnedEmployeeOrThrow(Long employeeId, Long businessId) {
+        return employeeRepository.findByIdAndBusinessIdAndActiveTrue(employeeId, businessId)
                 .orElseThrow(() -> new ResourceNotFoundException("Empleado no encontrado con id " + employeeId));
     }
 

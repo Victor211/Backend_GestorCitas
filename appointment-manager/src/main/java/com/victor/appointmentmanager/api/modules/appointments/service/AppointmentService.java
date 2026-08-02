@@ -14,15 +14,25 @@ public interface AppointmentService {
 
     AppointmentResponse create(CreateAppointmentRequest request);
 
-    AppointmentResponse findById(Long id, Long businessId);
+    /**
+     * Used only by internal, non-JWT channels (e.g. the WhatsApp conversational flow) that already
+     * resolved the Business by other means (phone_number_id) and cannot rely on the SecurityContext.
+     */
+    AppointmentResponse create(Long businessId, CreateAppointmentRequest request);
 
-    Page<AppointmentResponse> findAll(Long businessId, Long employeeId, Long customerId,
+    AppointmentResponse findById(Long id);
+
+    Page<AppointmentResponse> findAll(Long employeeId, Long customerId,
                                        AppointmentStatus status, Instant from, Instant to, Pageable pageable);
 
-    AppointmentResponse reschedule(Long id, Long businessId, RescheduleAppointmentRequest request);
+    AppointmentResponse reschedule(Long id, RescheduleAppointmentRequest request);
 
-    AppointmentResponse updateStatus(Long id, Long businessId, UpdateAppointmentStatusRequest request);
+    AppointmentResponse reschedule(Long businessId, Long id, RescheduleAppointmentRequest request);
 
-    AppointmentResponse cancel(Long id, Long businessId);
+    AppointmentResponse updateStatus(Long id, UpdateAppointmentStatusRequest request);
+
+    AppointmentResponse cancel(Long id);
+
+    AppointmentResponse cancel(Long businessId, Long id);
 
 }

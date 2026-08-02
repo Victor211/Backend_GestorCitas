@@ -57,11 +57,10 @@ public class AppointmentController {
                     responseCode = "400", description = "Datos inválidos o fecha en el pasado",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "404", description = "Business, Customer, Employee o Service no encontrado",
+                    responseCode = "404", description = "Customer, Employee o Service no encontrado en el negocio",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "409", description = "Cita fuera de horario, superpuesta, o relación "
-                            + "perteneciente a otro negocio",
+                    responseCode = "409", description = "Cita fuera de horario o superpuesta",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "500", description = "Error interno del servidor",
@@ -73,13 +72,10 @@ public class AppointmentController {
     }
 
     @GetMapping("/{id}")
-    @Operation(summary = "Obtener una cita por su id, dentro de un negocio")
+    @Operation(summary = "Obtener una cita por su id, dentro del negocio autenticado")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Cita encontrada"),
-            @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "businessId es obligatorio",
-                    content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "404", description = "Cita no encontrada en ese negocio",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
@@ -87,29 +83,24 @@ public class AppointmentController {
                     responseCode = "500", description = "Error interno del servidor",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
-    public ApiResponse<AppointmentResponse> findById(
-            @PathVariable Long id,
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId) {
-        return ResponseFactory.success(appointmentService.findById(id, businessId));
+    public ApiResponse<AppointmentResponse> findById(@PathVariable Long id) {
+        return ResponseFactory.success(appointmentService.findById(id));
     }
 
     @GetMapping
-    @Operation(summary = "Listar citas de un negocio, con paginación y filtros opcionales",
-            description = "Ejemplo: /api/appointments?businessId=1&from=2026-08-01T00:00:00Z&to=2026-08-02T00:00:00Z")
+    @Operation(summary = "Listar citas del negocio autenticado, con paginación y filtros opcionales",
+            description = "Ejemplo: /api/appointments?from=2026-08-01T00:00:00Z&to=2026-08-02T00:00:00Z")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Listado obtenido correctamente"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "businessId es obligatorio, o rango de fechas inválido",
+                    responseCode = "400", description = "Rango de fechas inválido",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "500", description = "Error interno del servidor",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
     public ApiResponse<Page<AppointmentResponse>> findAll(
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId,
             @Parameter(description = "Id del empleado (opcional)")
             @RequestParam(required = false) Long employeeId,
             @Parameter(description = "Id del cliente (opcional)")
@@ -125,7 +116,7 @@ public class AppointmentController {
             @RequestParam(required = false) Instant to,
             @PageableDefault(sort = "startAt", direction = Sort.Direction.ASC) Pageable pageable) {
         Page<AppointmentResponse> page = appointmentService.findAll(
-                businessId, employeeId, customerId, status, from, to, pageable);
+                employeeId, customerId, status, from, to, pageable);
         return ResponseFactory.success(page);
     }
 
@@ -137,7 +128,7 @@ public class AppointmentController {
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Cita reprogramada"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "Datos inválidos, businessId faltante o fecha en el pasado",
+                    responseCode = "400", description = "Datos inválidos o fecha en el pasado",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "404", description = "Cita no encontrada en ese negocio",
@@ -151,10 +142,8 @@ public class AppointmentController {
     })
     public ApiResponse<AppointmentResponse> reschedule(
             @PathVariable Long id,
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId,
             @Valid @RequestBody RescheduleAppointmentRequest request) {
-        AppointmentResponse updated = appointmentService.reschedule(id, businessId, request);
+        AppointmentResponse updated = appointmentService.reschedule(id, request);
         return ResponseFactory.success("Cita reprogramada exitosamente", updated);
     }
 
@@ -166,7 +155,7 @@ public class AppointmentController {
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Estado actualizado"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "Datos inválidos o businessId faltante",
+                    responseCode = "400", description = "Datos inválidos",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "404", description = "Cita no encontrada en ese negocio",
@@ -180,10 +169,8 @@ public class AppointmentController {
     })
     public ApiResponse<AppointmentResponse> updateStatus(
             @PathVariable Long id,
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId,
             @Valid @RequestBody UpdateAppointmentStatusRequest request) {
-        AppointmentResponse updated = appointmentService.updateStatus(id, businessId, request);
+        AppointmentResponse updated = appointmentService.updateStatus(id, request);
         return ResponseFactory.success("Estado de la cita actualizado exitosamente", updated);
     }
 
@@ -195,20 +182,14 @@ public class AppointmentController {
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Cita cancelada"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "businessId es obligatorio",
-                    content = @Content(schema = @Schema(implementation = ApiError.class))),
-            @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "404", description = "Cita no encontrada en ese negocio",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "500", description = "Error interno del servidor",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
-    public ApiResponse<AppointmentResponse> cancel(
-            @PathVariable Long id,
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId) {
-        AppointmentResponse cancelled = appointmentService.cancel(id, businessId);
+    public ApiResponse<AppointmentResponse> cancel(@PathVariable Long id) {
+        AppointmentResponse cancelled = appointmentService.cancel(id);
         return ResponseFactory.success("Cita cancelada exitosamente", cancelled);
     }
 

@@ -17,7 +17,7 @@ public interface ScheduleService {
 
     List<ScheduleResponse> findAllByEmployee(Long employeeId);
 
-    List<ScheduleResponse> findAllByBusiness(Long businessId, Long employeeId, DayOfWeek dayOfWeek);
+    List<ScheduleResponse> findAllByBusiness(Long employeeId, DayOfWeek dayOfWeek);
 
     void delete(Long id);
 

@@ -2,7 +2,6 @@ package com.victor.appointmentmanager.api.modules.whatsapp.service.impl;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.victor.appointmentmanager.api.modules.ai.dto.request.ConversationRequest;
 import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationResponse;
 import com.victor.appointmentmanager.api.modules.ai.service.ConversationService;
 import com.victor.appointmentmanager.api.modules.whatsapp.client.WhatsAppClient;
@@ -163,12 +162,8 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
             return;
         }
 
-        ConversationRequest conversationRequest = new ConversationRequest();
-        conversationRequest.setBusinessId(business.getId());
-        conversationRequest.setCustomerPhone(message.getFrom());
-        conversationRequest.setMessage(message.getText().getBody());
-
-        ConversationResponse response = conversationService.handleMessage(conversationRequest);
+        ConversationResponse response = conversationService.processChannelConversation(
+                business.getId(), message.getFrom(), message.getText().getBody());
 
         if (response == null || response.getReply() == null || response.getReply().isBlank()) {
             log.warn("ConversationService devolvió una respuesta vacía. businessId={}", business.getId());

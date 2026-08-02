@@ -11,8 +11,6 @@ import java.util.Optional;
 
 public interface CustomerRepository extends JpaRepository<Customer, Long> {
 
-    Optional<Customer> findByIdAndActiveTrue(Long id);
-
     Optional<Customer> findByIdAndBusinessIdAndActiveTrue(Long id, Long businessId);
 
     Optional<Customer> findByBusinessIdAndPhoneAndActiveTrue(Long businessId, String phone);

@@ -9,7 +9,6 @@ import com.victor.appointmentmanager.api.modules.services.entity.Service;
 import com.victor.appointmentmanager.api.modules.services.mapper.ServiceMapper;
 import com.victor.appointmentmanager.api.modules.services.repository.ServiceRepository;
 import com.victor.appointmentmanager.api.modules.services.service.ServiceService;
-import com.victor.appointmentmanager.api.security.BusinessAccessValidator;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
@@ -25,15 +24,14 @@ public class ServiceServiceImpl implements ServiceService {
     private final ServiceRepository serviceRepository;
     private final BusinessRepository businessRepository;
     private final ServiceMapper serviceMapper;
-    private final BusinessAccessValidator businessAccessValidator;
     private final CurrentUserProvider currentUserProvider;
 
     @Override
     @Transactional
     public ServiceResponse create(CreateServiceRequest request) {
-        businessAccessValidator.validate(request.getBusinessId());
-        assertNameIsAvailable(request.getName());
-        Business business = findActiveBusinessOrThrow(request.getBusinessId());
+        Long businessId = currentUserProvider.getCurrentBusinessId();
+        Business business = findActiveBusinessOrThrow(businessId);
+        assertNameIsAvailable(request.getName(), businessId);
 
         Service service = serviceMapper.toEntity(request);
         service.setBusiness(business);
@@ -45,17 +43,14 @@ public class ServiceServiceImpl implements ServiceService {
     @Override
     @Transactional
     public ServiceResponse update(Long id, UpdateServiceRequest request) {
-        businessAccessValidator.validate(request.getBusinessId());
-        Service service = findOwnedByIdOrThrow(id);
+        Long businessId = currentUserProvider.getCurrentBusinessId();
+        Service service = findOwnedByIdOrThrow(id, businessId);
 
         if (!service.getName().equalsIgnoreCase(request.getName())) {
-            assertNameIsAvailable(request.getName());
+            assertNameIsAvailable(request.getName(), businessId);
         }
 
-        Business business = findActiveBusinessOrThrow(request.getBusinessId());
-
         serviceMapper.updateEntityFromRequest(request, service);
-        service.setBusiness(business);
 
         Service updated = serviceRepository.save(service);
         return serviceMapper.toDto(updated);
@@ -64,7 +59,7 @@ public class ServiceServiceImpl implements ServiceService {
     @Override
     @Transactional(readOnly = true)
     public ServiceResponse findById(Long id) {
-        return serviceMapper.toDto(findOwnedByIdOrThrow(id));
+        return serviceMapper.toDto(findOwnedByIdOrThrow(id, currentUserProvider.getCurrentBusinessId()));
     }
 
     @Override
@@ -79,13 +74,13 @@ public class ServiceServiceImpl implements ServiceService {
     @Override
     @Transactional
     public void delete(Long id) {
-        Service service = findOwnedByIdOrThrow(id);
+        Service service = findOwnedByIdOrThrow(id, currentUserProvider.getCurrentBusinessId());
         service.setActive(false);
         serviceRepository.save(service);
     }
 
-    private Service findOwnedByIdOrThrow(Long id) {
-        return serviceRepository.findByIdAndBusinessIdAndActiveTrue(id, currentUserProvider.getCurrentBusinessId())
+    private Service findOwnedByIdOrThrow(Long id, Long businessId) {
+        return serviceRepository.findByIdAndBusinessIdAndActiveTrue(id, businessId)
                 .orElseThrow(() -> new ResourceNotFoundException("Servicio no encontrado con id " + id));
     }
 
@@ -94,8 +89,8 @@ public class ServiceServiceImpl implements ServiceService {
                 .orElseThrow(() -> new ResourceNotFoundException("Negocio no encontrado con id " + businessId));
     }
 
-    private void assertNameIsAvailable(String name) {
-        if (serviceRepository.existsByNameIgnoreCase(name)) {
+    private void assertNameIsAvailable(String name, Long businessId) {
+        if (serviceRepository.existsByNameIgnoreCaseAndBusinessId(name, businessId)) {
             throw new BusinessException("Ya existe un servicio con el nombre '" + name + "'");
         }
     }

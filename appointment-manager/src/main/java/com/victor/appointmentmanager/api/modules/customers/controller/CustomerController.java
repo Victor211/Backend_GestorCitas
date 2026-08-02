@@ -62,34 +62,29 @@ public class CustomerController {
     }
 
     @GetMapping
-    @Operation(summary = "Listar clientes activos de un negocio, con paginación y búsqueda opcional por nombre/apellido")
+    @Operation(summary = "Listar clientes activos del negocio autenticado, con paginación y búsqueda opcional por nombre/apellido")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Listado obtenido correctamente"),
-            @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "businessId es obligatorio",
-                    content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "500", description = "Error interno del servidor",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
     public ApiResponse<Page<CustomerResponse>> findAll(
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId,
             @Parameter(description = "Filtro parcial por nombre o apellido, ignorando mayúsculas/minúsculas")
             @RequestParam(required = false) String name,
             Pageable pageable) {
-        Page<CustomerResponse> page = customerService.findAll(businessId, name, pageable);
+        Page<CustomerResponse> page = customerService.findAll(name, pageable);
         return ResponseFactory.success(page);
     }
 
     @GetMapping("/by-phone")
-    @Operation(summary = "Buscar un cliente por teléfono dentro de un negocio")
+    @Operation(summary = "Buscar un cliente por teléfono dentro del negocio autenticado")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Cliente encontrado"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "businessId y phone son obligatorios",
+                    responseCode = "400", description = "phone es obligatorio",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "404", description = "Cliente no encontrado",
@@ -99,11 +94,9 @@ public class CustomerController {
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
     public ApiResponse<CustomerResponse> findByPhone(
-            @Parameter(description = "Id del negocio (obligatorio)")
-            @RequestParam(required = false) Long businessId,
             @Parameter(description = "Teléfono exacto del cliente (obligatorio)")
-            @RequestParam(required = false) String phone) {
-        return ResponseFactory.success(customerService.findByPhone(businessId, phone));
+            @RequestParam String phone) {
+        return ResponseFactory.success(customerService.findByPhone(phone));
     }
 
     @GetMapping("/{id}")

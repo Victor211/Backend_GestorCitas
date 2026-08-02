@@ -21,6 +21,7 @@ import com.victor.appointmentmanager.api.modules.schedule.entity.Schedule;
 import com.victor.appointmentmanager.api.modules.schedule.repository.ScheduleRepository;
 import com.victor.appointmentmanager.api.modules.services.entity.Service;
 import com.victor.appointmentmanager.api.modules.services.repository.ServiceRepository;
+import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import lombok.RequiredArgsConstructor;
@@ -57,39 +58,50 @@ public class ConversationServiceImpl implements ConversationService {
     private final ScheduleRepository scheduleRepository;
     private final AppointmentRepository appointmentRepository;
     private final AppointmentService appointmentService;
+    private final CurrentUserProvider currentUserProvider;
 
     @Override
     @Transactional
-    public ConversationResponse handleMessage(ConversationRequest request) {
-        Business business = findActiveBusinessOrThrow(request.getBusinessId());
+    public ConversationResponse processAuthenticatedConversation(ConversationRequest request) {
+        return process(currentUserProvider.getCurrentBusinessId(), request.getCustomerPhone(), request.getMessage());
+    }
+
+    @Override
+    @Transactional
+    public ConversationResponse processChannelConversation(Long businessId, String customerPhone, String message) {
+        return process(businessId, customerPhone, message);
+    }
+
+    private ConversationResponse process(Long businessId, String customerPhone, String message) {
+        Business business = findActiveBusinessOrThrow(businessId);
 
         String systemPrompt = systemPromptBuilder.build(buildBusinessContext(business));
-        String rawAiReply = aiProvider.generateResponse(systemPrompt, request.getMessage());
+        String rawAiReply = aiProvider.generateResponse(systemPrompt, message);
 
         ParsedAiReply parsed = parseAiReply(rawAiReply);
 
-        Long appointmentId = dispatch(request, business, parsed);
+        Long appointmentId = dispatch(customerPhone, business, parsed);
 
         return new ConversationResponse(parsed.reply(), parsed.intent(), parsed.confidence(), appointmentId);
     }
 
-    private Long dispatch(ConversationRequest request, Business business, ParsedAiReply parsed) {
+    private Long dispatch(String customerPhone, Business business, ParsedAiReply parsed) {
         return switch (parsed.intent()) {
-            case BOOK_APPOINTMENT -> handleBookAppointment(request, business, parsed);
-            case RESCHEDULE_APPOINTMENT -> handleReschedule(request, business, parsed);
-            case CANCEL_APPOINTMENT -> handleCancel(request, business);
+            case BOOK_APPOINTMENT -> handleBookAppointment(customerPhone, business, parsed);
+            case RESCHEDULE_APPOINTMENT -> handleReschedule(customerPhone, business, parsed);
+            case CANCEL_APPOINTMENT -> handleCancel(customerPhone, business);
             case CHECK_AVAILABILITY, GREETING, UNKNOWN -> null;
         };
     }
 
-    private Long handleBookAppointment(ConversationRequest request, Business business, ParsedAiReply parsed) {
+    private Long handleBookAppointment(String customerPhone, Business business, ParsedAiReply parsed) {
         if (parsed.serviceName() == null || parsed.startAt() == null) {
             return null;
         }
 
         Optional<Service> service = findServiceByName(business.getId(), parsed.serviceName());
         Optional<Customer> customer = customerRepository.findByBusinessIdAndPhoneAndActiveTrue(
-                business.getId(), request.getCustomerPhone());
+                business.getId(), customerPhone);
 
         if (service.isEmpty() || customer.isEmpty()) {
             return null;
@@ -101,23 +113,22 @@ public class ConversationServiceImpl implements ConversationService {
         }
 
         CreateAppointmentRequest createRequest = new CreateAppointmentRequest();
-        createRequest.setBusinessId(business.getId());
         createRequest.setCustomerId(customer.get().getId());
         createRequest.setEmployeeId(employee.get().getId());
         createRequest.setServiceId(service.get().getId());
         createRequest.setStartAt(parsed.startAt());
 
-        return attempt(() -> appointmentService.create(createRequest).getId());
+        return attempt(() -> appointmentService.create(business.getId(), createRequest).getId());
     }
 
-    private Long handleReschedule(ConversationRequest request, Business business, ParsedAiReply parsed) {
+    private Long handleReschedule(String customerPhone, Business business, ParsedAiReply parsed) {
         if (parsed.startAt() == null) {
             return null;
         }
 
         Long appointmentId = parsed.appointmentId() != null
                 ? parsed.appointmentId()
-                : findNextUpcomingAppointmentId(request, business).orElse(null);
+                : findNextUpcomingAppointmentId(customerPhone, business).orElse(null);
 
         if (appointmentId == null) {
             return null;
@@ -127,22 +138,22 @@ public class ConversationServiceImpl implements ConversationService {
         rescheduleRequest.setStartAt(parsed.startAt());
 
         Long id = appointmentId;
-        return attempt(() -> appointmentService.reschedule(id, business.getId(), rescheduleRequest).getId());
+        return attempt(() -> appointmentService.reschedule(business.getId(), id, rescheduleRequest).getId());
     }
 
-    private Long handleCancel(ConversationRequest request, Business business) {
-        Long appointmentId = findNextUpcomingAppointmentId(request, business).orElse(null);
+    private Long handleCancel(String customerPhone, Business business) {
+        Long appointmentId = findNextUpcomingAppointmentId(customerPhone, business).orElse(null);
         if (appointmentId == null) {
             return null;
         }
 
         Long id = appointmentId;
-        return attempt(() -> appointmentService.cancel(id, business.getId()).getId());
+        return attempt(() -> appointmentService.cancel(business.getId(), id).getId());
     }
 
-    private Optional<Long> findNextUpcomingAppointmentId(ConversationRequest request, Business business) {
+    private Optional<Long> findNextUpcomingAppointmentId(String customerPhone, Business business) {
         Optional<Customer> customer = customerRepository.findByBusinessIdAndPhoneAndActiveTrue(
-                business.getId(), request.getCustomerPhone());
+                business.getId(), customerPhone);
         if (customer.isEmpty()) {
             return Optional.empty();
         }

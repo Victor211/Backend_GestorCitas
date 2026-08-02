@@ -1,7 +1,6 @@
 package com.victor.appointmentmanager.api.modules.whatsapp.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.victor.appointmentmanager.api.modules.ai.dto.request.ConversationRequest;
 import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationResponse;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationIntent;
 import com.victor.appointmentmanager.api.modules.ai.service.ConversationService;
@@ -15,7 +14,6 @@ import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -23,6 +21,7 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
@@ -158,19 +157,12 @@ class WhatsAppWebhookServiceImplTest {
 
         ConversationResponse conversationResponse = new ConversationResponse(
                 "¡Hola! ¿En qué puedo ayudarte?", ConversationIntent.GREETING, 0.9, null);
-        when(conversationService.handleMessage(any(ConversationRequest.class))).thenReturn(conversationResponse);
+        when(conversationService.processChannelConversation(1L, "595981000000", "Hola"))
+                .thenReturn(conversationResponse);
 
         webhookService.processWebhook(textMessagePayload("wamid.MSG1", "595981000000", "Hola"));
 
-        ArgumentCaptor<ConversationRequest> requestCaptor = ArgumentCaptor.forClass(ConversationRequest.class);
-        verify(conversationService).handleMessage(requestCaptor.capture());
-        assertThatCode(() -> {
-            ConversationRequest sent = requestCaptor.getValue();
-            org.assertj.core.api.Assertions.assertThat(sent.getBusinessId()).isEqualTo(1L);
-            org.assertj.core.api.Assertions.assertThat(sent.getCustomerPhone()).isEqualTo("595981000000");
-            org.assertj.core.api.Assertions.assertThat(sent.getMessage()).isEqualTo("Hola");
-        }).doesNotThrowAnyException();
-
+        verify(conversationService).processChannelConversation(1L, "595981000000", "Hola");
         verify(whatsAppClient).sendTextMessage("PHONE_ID_1", "595981000000", "¡Hola! ¿En qué puedo ayudarte?");
         verify(eventTracker).markProcessed(100L);
         verify(eventTracker, never()).markFailed(any(), anyString());
@@ -185,7 +177,7 @@ class WhatsAppWebhookServiceImplTest {
         webhookService.processWebhook(textMessagePayload("wamid.MSG2", "595981000000", "Hola"));
 
         verify(eventTracker, never()).registerReceived(any(), any(), any(), any());
-        verify(conversationService, never()).handleMessage(any());
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
     }
 
     @Test
@@ -196,7 +188,7 @@ class WhatsAppWebhookServiceImplTest {
         webhookService.processWebhook(textMessagePayload("wamid.MSG3", "595981000000", "Hola"));
 
         verify(businessRepository, never()).findByWhatsappPhoneNumberIdAndActiveTrue(any());
-        verify(conversationService, never()).handleMessage(any());
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
     }
 
     @Test
@@ -204,7 +196,7 @@ class WhatsAppWebhookServiceImplTest {
         assertThatCode(() -> webhookService.processWebhook("{\"object\":\"whatsapp_business_account\"}"))
                 .doesNotThrowAnyException();
 
-        verify(conversationService, never()).handleMessage(any());
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
     }
 
     @Test
@@ -217,7 +209,7 @@ class WhatsAppWebhookServiceImplTest {
 
         assertThatCode(() -> webhookService.processWebhook(payload)).doesNotThrowAnyException();
 
-        verify(conversationService, never()).handleMessage(any());
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
     }
 
     @Test
@@ -225,7 +217,7 @@ class WhatsAppWebhookServiceImplTest {
         assertThatCode(() -> webhookService.processWebhook(statusOnlyPayload())).doesNotThrowAnyException();
 
         verify(businessRepository, never()).findByWhatsappPhoneNumberIdAndActiveTrue(any());
-        verify(conversationService, never()).handleMessage(any());
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
     }
 
     @Test
@@ -238,7 +230,7 @@ class WhatsAppWebhookServiceImplTest {
 
         webhookService.processWebhook(nonTextMessagePayload("wamid.MSG4", "595981000000"));
 
-        verify(conversationService, never()).handleMessage(any());
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
         verify(whatsAppClient).sendTextMessage(eq("PHONE_ID_1"), eq("595981000000"),
                 eq("Por el momento solo puedo procesar mensajes de texto."));
         verify(eventTracker).markProcessed(101L);
@@ -251,7 +243,8 @@ class WhatsAppWebhookServiceImplTest {
                 .thenReturn(Optional.of(business));
         when(eventTracker.registerReceived(1L, "wamid.MSG5", "595981000000", "text"))
                 .thenReturn(existingEvent(102L));
-        when(conversationService.handleMessage(any())).thenThrow(new RuntimeException("fallo interno de IA"));
+        when(conversationService.processChannelConversation(anyLong(), anyString(), anyString()))
+                .thenThrow(new RuntimeException("fallo interno de IA"));
 
         webhookService.processWebhook(textMessagePayload("wamid.MSG5", "595981000000", "Hola"));
 
@@ -270,7 +263,8 @@ class WhatsAppWebhookServiceImplTest {
 
         ConversationResponse conversationResponse = new ConversationResponse(
                 "Respuesta", ConversationIntent.UNKNOWN, 0.1, null);
-        when(conversationService.handleMessage(any())).thenReturn(conversationResponse);
+        when(conversationService.processChannelConversation(anyLong(), anyString(), anyString()))
+                .thenReturn(conversationResponse);
         when(whatsAppClient.sendTextMessage(any(), any(), any()))
                 .thenThrow(new WhatsAppApiException("No se pudo enviar el mensaje"));
 

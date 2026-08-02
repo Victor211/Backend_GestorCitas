@@ -12,8 +12,6 @@ import java.util.Optional;
 
 public interface ScheduleRepository extends JpaRepository<Schedule, Long> {
 
-    Optional<Schedule> findByIdAndActiveTrue(Long id);
-
     @Query("""
             SELECT s FROM Schedule s
             WHERE s.id = :id

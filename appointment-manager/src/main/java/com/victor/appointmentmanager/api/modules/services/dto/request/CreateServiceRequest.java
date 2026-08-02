@@ -40,7 +40,4 @@ public class CreateServiceRequest {
     @Pattern(regexp = "^#[A-Fa-f0-9]{6}$", message = "El color debe tener formato hexadecimal, ejemplo: #3B82F6")
     private String color;
 
-    @NotNull
-    private Long businessId;
-
 }

@@ -9,15 +9,11 @@ import java.util.Optional;
 
 public interface EmployeeRepository extends JpaRepository<Employee, Long> {
 
-    Optional<Employee> findByIdAndActiveTrue(Long id);
-
     Optional<Employee> findByIdAndBusinessIdAndActiveTrue(Long id, Long businessId);
-
-    Page<Employee> findByFirstNameContainingIgnoreCaseAndActiveTrue(String firstName, Pageable pageable);
 
     Page<Employee> findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(Long businessId, String firstName,
                                                                                   Pageable pageable);
 
-    boolean existsByPhone(String phone);
+    boolean existsByPhoneAndBusinessId(String phone, Long businessId);
 
 }

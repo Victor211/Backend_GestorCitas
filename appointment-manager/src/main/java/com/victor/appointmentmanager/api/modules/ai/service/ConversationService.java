@@ -5,6 +5,15 @@ import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationRes
 
 public interface ConversationService {
 
-    ConversationResponse handleMessage(ConversationRequest request);
+    /**
+     * Entry point for the authenticated panel: Business is resolved from the JWT.
+     */
+    ConversationResponse processAuthenticatedConversation(ConversationRequest request);
+
+    /**
+     * Entry point for non-JWT channels (e.g. WhatsApp) that already resolved the Business
+     * by other means (phone_number_id) and cannot rely on the SecurityContext.
+     */
+    ConversationResponse processChannelConversation(Long businessId, String customerPhone, String message);
 
 }

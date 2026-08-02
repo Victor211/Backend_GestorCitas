@@ -16,9 +16,6 @@ import java.time.Instant;
 public class CreateAppointmentRequest {
 
     @NotNull
-    private Long businessId;
-
-    @NotNull
     private Long customerId;
 
     @NotNull

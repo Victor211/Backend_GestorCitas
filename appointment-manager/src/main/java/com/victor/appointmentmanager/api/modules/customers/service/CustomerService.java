@@ -14,9 +14,9 @@ public interface CustomerService {
 
     CustomerResponse findById(Long id);
 
-    Page<CustomerResponse> findAll(Long businessId, String name, Pageable pageable);
+    Page<CustomerResponse> findAll(String name, Pageable pageable);
 
-    CustomerResponse findByPhone(Long businessId, String phone);
+    CustomerResponse findByPhone(String phone);
 
     void delete(Long id);
 

@@ -11,7 +11,6 @@ import com.victor.appointmentmanager.api.modules.schedule.entity.Schedule;
 import com.victor.appointmentmanager.api.modules.schedule.exception.ScheduleNotFoundException;
 import com.victor.appointmentmanager.api.modules.schedule.mapper.ScheduleMapper;
 import com.victor.appointmentmanager.api.modules.schedule.repository.ScheduleRepository;
-import com.victor.appointmentmanager.api.security.BusinessAccessValidator;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
@@ -50,9 +49,6 @@ class ScheduleServiceImplTest {
 
     @Mock
     private ScheduleMapper scheduleMapper;
-
-    @Mock
-    private BusinessAccessValidator businessAccessValidator;
 
     @Mock
     private CurrentUserProvider currentUserProvider;
@@ -95,7 +91,7 @@ class ScheduleServiceImplTest {
         request.setStartTime(LocalTime.of(8, 0));
         request.setEndTime(LocalTime.of(12, 0));
 
-        when(employeeRepository.findByIdAndActiveTrue(5L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
         when(scheduleRepository.existsOverlapping(5L, DayOfWeek.MONDAY,
                 request.getStartTime(), request.getEndTime(), null)).thenReturn(false);
         when(scheduleMapper.toEntity(request)).thenReturn(schedule);
@@ -110,7 +106,6 @@ class ScheduleServiceImplTest {
         assertThat(result.getId()).isEqualTo(20L);
         assertThat(schedule.getEmployee()).isEqualTo(employee);
         verify(scheduleRepository).save(schedule);
-        verify(businessAccessValidator).validate(1L);
     }
 
     @Test
@@ -121,7 +116,23 @@ class ScheduleServiceImplTest {
         request.setStartTime(LocalTime.of(8, 0));
         request.setEndTime(LocalTime.of(12, 0));
 
-        when(employeeRepository.findByIdAndActiveTrue(999L)).thenReturn(Optional.empty());
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(999L, 1L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> scheduleService.create(request))
+                .isInstanceOf(ResourceNotFoundException.class);
+
+        verify(scheduleRepository, never()).save(any());
+    }
+
+    @Test
+    void throwsWhenEmployeeBelongsToAnotherBusiness() {
+        CreateScheduleRequest request = new CreateScheduleRequest();
+        request.setEmployeeId(5L);
+        request.setDayOfWeek(DayOfWeek.MONDAY);
+        request.setStartTime(LocalTime.of(8, 0));
+        request.setEndTime(LocalTime.of(12, 0));
+
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> scheduleService.create(request))
                 .isInstanceOf(ResourceNotFoundException.class);
@@ -137,7 +148,7 @@ class ScheduleServiceImplTest {
         request.setStartTime(LocalTime.of(8, 0));
         request.setEndTime(LocalTime.of(8, 0));
 
-        when(employeeRepository.findByIdAndActiveTrue(5L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
 
         assertThatThrownBy(() -> scheduleService.create(request))
                 .isInstanceOf(BusinessException.class);
@@ -153,7 +164,7 @@ class ScheduleServiceImplTest {
         request.setStartTime(LocalTime.of(14, 0));
         request.setEndTime(LocalTime.of(10, 0));
 
-        when(employeeRepository.findByIdAndActiveTrue(5L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
 
         assertThatThrownBy(() -> scheduleService.create(request))
                 .isInstanceOf(BusinessException.class);
@@ -169,7 +180,7 @@ class ScheduleServiceImplTest {
         request.setStartTime(LocalTime.of(10, 0));
         request.setEndTime(LocalTime.of(14, 0));
 
-        when(employeeRepository.findByIdAndActiveTrue(5L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
         when(scheduleRepository.existsOverlapping(5L, DayOfWeek.MONDAY,
                 request.getStartTime(), request.getEndTime(), null)).thenReturn(true);
 
@@ -187,7 +198,7 @@ class ScheduleServiceImplTest {
         request.setStartTime(LocalTime.of(12, 0));
         request.setEndTime(LocalTime.of(16, 0));
 
-        when(employeeRepository.findByIdAndActiveTrue(5L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
         when(scheduleRepository.existsOverlapping(5L, DayOfWeek.MONDAY,
                 request.getStartTime(), request.getEndTime(), null)).thenReturn(false);
         when(scheduleMapper.toEntity(request)).thenReturn(schedule);
@@ -259,7 +270,7 @@ class ScheduleServiceImplTest {
 
     @Test
     void listsSchedulesByEmployee() {
-        when(employeeRepository.findByIdAndActiveTrue(5L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
         when(scheduleRepository.findByEmployeeIdAndActiveTrueOrderByDayOfWeekAscStartTimeAsc(5L))
                 .thenReturn(List.of(schedule));
 
@@ -271,7 +282,29 @@ class ScheduleServiceImplTest {
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).getId()).isEqualTo(20L);
-        verify(businessAccessValidator).validate(1L);
+    }
+
+    @Test
+    void throwsWhenListingSchedulesForEmployeeOfAnotherBusiness() {
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> scheduleService.findAllByEmployee(5L))
+                .isInstanceOf(ResourceNotFoundException.class);
+    }
+
+    @Test
+    void listsSchedulesByBusinessUsingCurrentBusinessId() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(scheduleRepository.findActiveByBusiness(1L, null, null)).thenReturn(List.of(schedule));
+
+        ScheduleResponse response = new ScheduleResponse();
+        response.setId(20L);
+        when(scheduleMapper.toDto(schedule)).thenReturn(response);
+
+        List<ScheduleResponse> result = scheduleService.findAllByBusiness(null, null);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getId()).isEqualTo(20L);
     }
 
 }

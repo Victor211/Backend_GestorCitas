@@ -12,6 +12,7 @@ import com.victor.appointmentmanager.api.modules.appointments.exception.Appointm
 import com.victor.appointmentmanager.api.modules.appointments.mapper.AppointmentMapper;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
+import com.victor.appointmentmanager.api.modules.customers.exception.CustomerNotFoundException;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
 import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
 import com.victor.appointmentmanager.api.modules.employees.repository.EmployeeRepository;
@@ -19,7 +20,7 @@ import com.victor.appointmentmanager.api.modules.schedule.entity.Schedule;
 import com.victor.appointmentmanager.api.modules.schedule.repository.ScheduleRepository;
 import com.victor.appointmentmanager.api.modules.services.entity.Service;
 import com.victor.appointmentmanager.api.modules.services.repository.ServiceRepository;
-import com.victor.appointmentmanager.api.security.BusinessAccessValidator;
+import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,7 +33,6 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.time.DayOfWeek;
@@ -51,6 +51,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -82,7 +83,7 @@ class AppointmentServiceImplTest {
     private AppointmentMapper appointmentMapper;
 
     @Mock
-    private BusinessAccessValidator businessAccessValidator;
+    private CurrentUserProvider currentUserProvider;
 
     @InjectMocks
     private AppointmentServiceImpl appointmentService;
@@ -132,11 +133,12 @@ class AppointmentServiceImplTest {
         schedule.setDayOfWeek(DayOfWeek.MONDAY);
         schedule.setStartTime(LocalTime.of(8, 0));
         schedule.setEndTime(LocalTime.of(12, 0));
+
+        lenient().when(currentUserProvider.getCurrentBusinessId()).thenReturn(1L);
     }
 
     private CreateAppointmentRequest buildCreateRequest() {
         CreateAppointmentRequest request = new CreateAppointmentRequest();
-        request.setBusinessId(1L);
         request.setCustomerId(2L);
         request.setEmployeeId(3L);
         request.setServiceId(4L);
@@ -150,9 +152,9 @@ class AppointmentServiceImplTest {
         Appointment appointment = new Appointment();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
         when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
                 .thenReturn(List.of(schedule));
         when(appointmentRepository.existsOverlapping(3L, startAt, endAt, null, AppointmentStatus.CANCELLED))
@@ -181,9 +183,9 @@ class AppointmentServiceImplTest {
         Appointment appointment = new Appointment();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
         when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
                 .thenReturn(List.of(schedule));
         when(appointmentRepository.existsOverlapping(3L, startAt, endAt, null, AppointmentStatus.CANCELLED))
@@ -203,9 +205,9 @@ class AppointmentServiceImplTest {
         request.setStartAt(Instant.now().minusSeconds(3600));
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
 
         assertThatThrownBy(() -> appointmentService.create(request))
                 .isInstanceOf(BusinessException.class);
@@ -214,55 +216,43 @@ class AppointmentServiceImplTest {
     }
 
     @Test
-    void throwsWhenCustomerBelongsToAnotherBusiness() {
-        Business otherBusiness = new Business();
-        otherBusiness.setId(999L);
-        customer.setBusiness(otherBusiness);
-
+    void throwsNotFoundWhenCustomerBelongsToAnotherBusiness() {
         CreateAppointmentRequest request = buildCreateRequest();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> appointmentService.create(request))
-                .isInstanceOf(BusinessException.class);
+                .isInstanceOf(CustomerNotFoundException.class);
 
         verify(appointmentRepository, never()).save(any());
     }
 
     @Test
-    void throwsWhenEmployeeBelongsToAnotherBusiness() {
-        Business otherBusiness = new Business();
-        otherBusiness.setId(999L);
-        employee.setBusiness(otherBusiness);
-
+    void throwsNotFoundWhenEmployeeBelongsToAnotherBusiness() {
         CreateAppointmentRequest request = buildCreateRequest();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> appointmentService.create(request))
-                .isInstanceOf(BusinessException.class);
+                .isInstanceOf(ResourceNotFoundException.class);
 
         verify(appointmentRepository, never()).save(any());
     }
 
     @Test
-    void throwsWhenServiceBelongsToAnotherBusiness() {
-        Business otherBusiness = new Business();
-        otherBusiness.setId(999L);
-        service.setBusiness(otherBusiness);
-
+    void throwsNotFoundWhenServiceBelongsToAnotherBusiness() {
         CreateAppointmentRequest request = buildCreateRequest();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> appointmentService.create(request))
-                .isInstanceOf(BusinessException.class);
+                .isInstanceOf(ResourceNotFoundException.class);
 
         verify(appointmentRepository, never()).save(any());
     }
@@ -274,9 +264,9 @@ class AppointmentServiceImplTest {
         CreateAppointmentRequest request = buildCreateRequest();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
 
         assertThatThrownBy(() -> appointmentService.create(request))
                 .isInstanceOf(BusinessException.class);
@@ -294,9 +284,9 @@ class AppointmentServiceImplTest {
         request.setStartAt(earlyStart);
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
         when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
                 .thenReturn(List.of(schedule));
 
@@ -316,9 +306,9 @@ class AppointmentServiceImplTest {
         request.setStartAt(lateStart);
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
         when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
                 .thenReturn(List.of(schedule));
 
@@ -333,9 +323,9 @@ class AppointmentServiceImplTest {
         CreateAppointmentRequest request = buildCreateRequest();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
         when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
                 .thenReturn(List.of(schedule));
         when(appointmentRepository.existsOverlapping(3L, startAt, endAt, null, AppointmentStatus.CANCELLED))
@@ -353,9 +343,9 @@ class AppointmentServiceImplTest {
         Appointment appointment = new Appointment();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
         when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
                 .thenReturn(List.of(schedule));
         when(appointmentRepository.existsOverlapping(3L, startAt, endAt, null, AppointmentStatus.CANCELLED))
@@ -376,14 +366,36 @@ class AppointmentServiceImplTest {
         CreateAppointmentRequest request = buildCreateRequest();
 
         when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
-        when(customerRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(customer));
-        when(employeeRepository.findByIdAndActiveTrue(3L)).thenReturn(Optional.of(employee));
-        when(serviceRepository.findByIdAndActiveTrue(4L)).thenReturn(Optional.of(service));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
 
         assertThatThrownBy(() -> appointmentService.create(request))
                 .isInstanceOf(BusinessException.class);
 
         verify(appointmentRepository, never()).save(any());
+    }
+
+    @Test
+    void createUsingExplicitBusinessIdOverloadUsedByAiChannel() {
+        CreateAppointmentRequest request = buildCreateRequest();
+        Appointment appointment = new Appointment();
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(customerRepository.findByIdAndBusinessIdAndActiveTrue(2L, 1L)).thenReturn(Optional.of(customer));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(3L, startAt, endAt, null, AppointmentStatus.CANCELLED))
+                .thenReturn(false);
+        when(appointmentMapper.toEntity(request)).thenReturn(appointment);
+        when(appointmentRepository.save(appointment)).thenReturn(appointment);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        appointmentService.create(1L, request);
+
+        verify(appointmentRepository).save(appointment);
     }
 
     @Test
@@ -402,10 +414,31 @@ class AppointmentServiceImplTest {
         when(appointmentRepository.save(appointment)).thenReturn(appointment);
         when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
 
-        appointmentService.reschedule(100L, 1L, request);
+        appointmentService.reschedule(100L, request);
 
         assertThat(appointment.getStartAt()).isEqualTo(newStart);
         assertThat(appointment.getEndAt()).isEqualTo(newStart.plusSeconds(1800));
+    }
+
+    @Test
+    void reschedulesAppointmentUsingExplicitBusinessIdOverloadUsedByAiChannel() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+
+        RescheduleAppointmentRequest request = new RescheduleAppointmentRequest();
+        Instant newStart = startAt.plusSeconds(3600);
+        request.setStartAt(newStart);
+
+        when(appointmentRepository.findByIdAndBusinessId(100L, 1L)).thenReturn(Optional.of(appointment));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(3L, newStart, newStart.plusSeconds(1800), 100L,
+                AppointmentStatus.CANCELLED)).thenReturn(false);
+        when(appointmentRepository.save(appointment)).thenReturn(appointment);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        appointmentService.reschedule(1L, 100L, request);
+
+        assertThat(appointment.getStartAt()).isEqualTo(newStart);
     }
 
     @Test
@@ -422,7 +455,7 @@ class AppointmentServiceImplTest {
         when(appointmentRepository.existsOverlapping(3L, newStart, newStart.plusSeconds(1800), 100L,
                 AppointmentStatus.CANCELLED)).thenReturn(true);
 
-        assertThatThrownBy(() -> appointmentService.reschedule(100L, 1L, request))
+        assertThatThrownBy(() -> appointmentService.reschedule(100L, request))
                 .isInstanceOf(BusinessException.class);
 
         verify(appointmentRepository, never()).save(any());
@@ -437,7 +470,7 @@ class AppointmentServiceImplTest {
 
         when(appointmentRepository.findByIdAndBusinessId(100L, 1L)).thenReturn(Optional.of(appointment));
 
-        assertThatThrownBy(() -> appointmentService.reschedule(100L, 1L, request))
+        assertThatThrownBy(() -> appointmentService.reschedule(100L, request))
                 .isInstanceOf(BusinessException.class);
 
         verify(appointmentRepository, never()).save(any());
@@ -451,10 +484,23 @@ class AppointmentServiceImplTest {
         when(appointmentRepository.save(appointment)).thenReturn(appointment);
         when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
 
-        appointmentService.cancel(100L, 1L);
+        appointmentService.cancel(100L);
 
         assertThat(appointment.getStatus()).isEqualTo(AppointmentStatus.CANCELLED);
         verify(appointmentRepository).save(appointment);
+    }
+
+    @Test
+    void cancelsAppointmentUsingExplicitBusinessIdOverloadUsedByAiChannel() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+
+        when(appointmentRepository.findByIdAndBusinessId(100L, 1L)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.save(appointment)).thenReturn(appointment);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        appointmentService.cancel(1L, 100L);
+
+        assertThat(appointment.getStatus()).isEqualTo(AppointmentStatus.CANCELLED);
     }
 
     @Test
@@ -464,7 +510,7 @@ class AppointmentServiceImplTest {
         when(appointmentRepository.findByIdAndBusinessId(100L, 1L)).thenReturn(Optional.of(appointment));
         when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
 
-        appointmentService.cancel(100L, 1L);
+        appointmentService.cancel(100L);
 
         assertThat(appointment.getStatus()).isEqualTo(AppointmentStatus.CANCELLED);
         verify(appointmentRepository, never()).save(any());
@@ -481,7 +527,7 @@ class AppointmentServiceImplTest {
         when(appointmentRepository.save(appointment)).thenReturn(appointment);
         when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
 
-        appointmentService.updateStatus(100L, 1L, request);
+        appointmentService.updateStatus(100L, request);
 
         assertThat(appointment.getStatus()).isEqualTo(AppointmentStatus.COMPLETED);
     }
@@ -495,7 +541,7 @@ class AppointmentServiceImplTest {
 
         when(appointmentRepository.findByIdAndBusinessId(100L, 1L)).thenReturn(Optional.of(appointment));
 
-        assertThatThrownBy(() -> appointmentService.updateStatus(100L, 1L, request))
+        assertThatThrownBy(() -> appointmentService.updateStatus(100L, request))
                 .isInstanceOf(BusinessException.class);
 
         verify(appointmentRepository, never()).save(any());
@@ -505,14 +551,17 @@ class AppointmentServiceImplTest {
     void throwsAppointmentNotFoundWhenMissing() {
         when(appointmentRepository.findByIdAndBusinessId(999L, 1L)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> appointmentService.findById(999L, 1L))
+        assertThatThrownBy(() -> appointmentService.findById(999L))
                 .isInstanceOf(AppointmentNotFoundException.class);
     }
 
     @Test
-    void throwsBadRequestWhenBusinessIdMissingOnFindById() {
-        assertThatThrownBy(() -> appointmentService.findById(999L, null))
-                .isInstanceOf(ResponseStatusException.class);
+    void throwsAppointmentNotFoundWhenAppointmentBelongsToAnotherBusiness() {
+        when(currentUserProvider.getCurrentBusinessId()).thenReturn(2L);
+        when(appointmentRepository.findByIdAndBusinessId(100L, 2L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> appointmentService.findById(100L))
+                .isInstanceOf(AppointmentNotFoundException.class);
     }
 
     @Test
@@ -526,7 +575,7 @@ class AppointmentServiceImplTest {
         when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
 
         Page<AppointmentResponse> result = appointmentService.findAll(
-                1L, 3L, null, AppointmentStatus.CONFIRMED, startAt, endAt, pageable);
+                3L, null, AppointmentStatus.CONFIRMED, startAt, endAt, pageable);
 
         assertThat(result.getTotalElements()).isEqualTo(1);
     }

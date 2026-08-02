@@ -10,18 +10,14 @@ import com.victor.appointmentmanager.api.modules.customers.exception.CustomerNot
 import com.victor.appointmentmanager.api.modules.customers.mapper.CustomerMapper;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
 import com.victor.appointmentmanager.api.modules.customers.service.CustomerService;
-import com.victor.appointmentmanager.api.security.BusinessAccessValidator;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.util.StringUtils;
-import org.springframework.web.server.ResponseStatusException;
 
 @Service
 @RequiredArgsConstructor
@@ -30,15 +26,14 @@ public class CustomerServiceImpl implements CustomerService {
     private final CustomerRepository customerRepository;
     private final BusinessRepository businessRepository;
     private final CustomerMapper customerMapper;
-    private final BusinessAccessValidator businessAccessValidator;
     private final CurrentUserProvider currentUserProvider;
 
     @Override
     @Transactional
     public CustomerResponse create(CreateCustomerRequest request) {
-        businessAccessValidator.validate(request.getBusinessId());
-        Business business = findActiveBusinessOrThrow(request.getBusinessId());
-        assertPhoneIsAvailable(request.getBusinessId(), request.getPhone());
+        Long businessId = currentUserProvider.getCurrentBusinessId();
+        Business business = findActiveBusinessOrThrow(businessId);
+        assertPhoneIsAvailable(businessId, request.getPhone());
 
         Customer customer = customerMapper.toEntity(request);
         customer.setBusiness(business);
@@ -70,12 +65,8 @@ public class CustomerServiceImpl implements CustomerService {
 
     @Override
     @Transactional(readOnly = true)
-    public Page<CustomerResponse> findAll(Long businessId, String name, Pageable pageable) {
-        if (businessId == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "businessId es obligatorio");
-        }
-        businessAccessValidator.validate(businessId);
-
+    public Page<CustomerResponse> findAll(String name, Pageable pageable) {
+        Long businessId = currentUserProvider.getCurrentBusinessId();
         String searchTerm = name != null ? name : "";
         return customerRepository.searchActiveByBusinessAndName(businessId, searchTerm, pageable)
                 .map(customerMapper::toDto);
@@ -83,11 +74,8 @@ public class CustomerServiceImpl implements CustomerService {
 
     @Override
     @Transactional(readOnly = true)
-    public CustomerResponse findByPhone(Long businessId, String phone) {
-        if (businessId == null || !StringUtils.hasText(phone)) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "businessId y phone son obligatorios");
-        }
-        businessAccessValidator.validate(businessId);
+    public CustomerResponse findByPhone(String phone) {
+        Long businessId = currentUserProvider.getCurrentBusinessId();
 
         Customer customer = customerRepository.findByBusinessIdAndPhoneAndActiveTrue(businessId, phone)
                 .orElseThrow(() -> new CustomerNotFoundException(
