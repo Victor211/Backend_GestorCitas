@@ -34,7 +34,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "spring.jpa.hibernate.ddl-auto=create-drop",
         "app.jwt.secret=test-only-dummy-secret-never-used-in-production-0123456789",
         "app.jwt.expiration=3600000",
-        "app.openai.api-key=test-key"
+        "app.openai.api-key=test-key",
+        "app.whatsapp.access-token=test-access-token",
+        "app.whatsapp.verify-token=test-verify-token",
+        "app.whatsapp.app-secret=test-app-secret",
+        "app.whatsapp.graph-api-version=v21.0",
+        "app.whatsapp.base-url=https://graph.example.com"
 })
 class AuthSecurityIntegrationTest {
 

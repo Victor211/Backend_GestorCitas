@@ -41,4 +41,10 @@ public class Business extends AuditableEntity {
     @Column(nullable = false)
     private String timezone;
 
+    @Column(unique = true)
+    private String whatsappPhoneNumberId;
+
+    @Column
+    private String whatsappBusinessAccountId;
+
 }

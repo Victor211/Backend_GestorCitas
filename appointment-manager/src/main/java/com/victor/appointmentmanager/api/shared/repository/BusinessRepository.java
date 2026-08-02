@@ -9,4 +9,6 @@ public interface BusinessRepository extends JpaRepository<Business, Long> {
 
     Optional<Business> findByIdAndActiveTrue(Long id);
 
+    Optional<Business> findByWhatsappPhoneNumberIdAndActiveTrue(String whatsappPhoneNumberId);
+
 }
