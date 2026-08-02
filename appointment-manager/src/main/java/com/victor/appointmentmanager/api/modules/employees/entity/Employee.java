@@ -16,6 +16,7 @@ import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.BatchSize;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -53,6 +54,7 @@ public class Employee extends AuditableEntity {
             joinColumns = @JoinColumn(name = "employee_id"),
             inverseJoinColumns = @JoinColumn(name = "service_id")
     )
+    @BatchSize(size = 20)
     private Set<Service> services = new HashSet<>();
 
 }

@@ -39,15 +39,21 @@ public class EmployeeController {
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    @Operation(summary = "Crear un nuevo empleado")
+    @Operation(summary = "Crear un nuevo empleado",
+            description = "Los serviceIds deben pertenecer al Business autenticado y corresponder a Services "
+                    + "activos; de lo contrario la operación se rechaza.")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "201", description = "Empleado creado"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "Datos inválidos",
+                    responseCode = "400", description = "Datos inválidos o serviceIds vacío",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "404", description = "Negocio no encontrado",
+                    responseCode = "404", description = "Negocio no encontrado, o algún Service no existe, "
+                            + "está inactivo o pertenece a otro negocio",
+                    content = @Content(schema = @Schema(implementation = ApiError.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = "Ya existe un empleado con ese teléfono en el negocio",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "500", description = "Error interno del servidor",
@@ -92,15 +98,21 @@ public class EmployeeController {
     }
 
     @PutMapping("/{id}")
-    @Operation(summary = "Actualizar un empleado existente")
+    @Operation(summary = "Actualizar un empleado existente",
+            description = "serviceIds reemplaza por completo las asignaciones anteriores del empleado. "
+                    + "Deben pertenecer al Business autenticado y corresponder a Services activos.")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Empleado actualizado"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = "Datos inválidos",
+                    responseCode = "400", description = "Datos inválidos o serviceIds vacío",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "404", description = "Empleado o negocio no encontrado",
+                    responseCode = "404", description = "Empleado no encontrado, o algún Service no existe, "
+                            + "está inactivo o pertenece a otro negocio",
+                    content = @Content(schema = @Schema(implementation = ApiError.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = "Ya existe un empleado con ese teléfono en el negocio",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "500", description = "Error interno del servidor",

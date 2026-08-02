@@ -6,6 +6,7 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 import java.time.Instant;
+import java.util.Set;
 
 @Getter
 @Setter
@@ -20,6 +21,7 @@ public class EmployeeResponse {
     private String email;
     private String color;
     private Long businessId;
+    private Set<EmployeeServiceResponse> services;
     private Boolean active;
     private Instant createdAt;
     private Instant updatedAt;

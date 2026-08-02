@@ -9,21 +9,27 @@ import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
 import com.victor.appointmentmanager.api.modules.employees.mapper.EmployeeMapper;
 import com.victor.appointmentmanager.api.modules.employees.repository.EmployeeRepository;
 import com.victor.appointmentmanager.api.modules.employees.service.EmployeeService;
+import com.victor.appointmentmanager.api.modules.services.entity.Service;
+import com.victor.appointmentmanager.api.modules.services.repository.ServiceRepository;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-@Service
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+@org.springframework.stereotype.Service
 @RequiredArgsConstructor
 public class EmployeeServiceImpl implements EmployeeService {
 
     private final EmployeeRepository employeeRepository;
     private final BusinessRepository businessRepository;
+    private final ServiceRepository serviceRepository;
     private final EmployeeMapper employeeMapper;
     private final CurrentUserProvider currentUserProvider;
 
@@ -33,9 +39,11 @@ public class EmployeeServiceImpl implements EmployeeService {
         Long businessId = currentUserProvider.getCurrentBusinessId();
         Business business = findActiveBusinessOrThrow(businessId);
         assertPhoneIsAvailable(request.getPhone(), businessId);
+        Set<Service> services = findOwnedServicesOrThrow(request.getServiceIds(), businessId);
 
         Employee employee = employeeMapper.toEntity(request);
         employee.setBusiness(business);
+        employee.setServices(services);
 
         Employee saved = employeeRepository.save(employee);
         return employeeMapper.toDto(saved);
@@ -51,7 +59,10 @@ public class EmployeeServiceImpl implements EmployeeService {
             assertPhoneIsAvailable(request.getPhone(), businessId);
         }
 
+        Set<Service> services = findOwnedServicesOrThrow(request.getServiceIds(), businessId);
+
         employeeMapper.updateEntityFromRequest(request, employee);
+        employee.setServices(services);
 
         Employee updated = employeeRepository.save(employee);
         return employeeMapper.toDto(updated);
@@ -94,6 +105,15 @@ public class EmployeeServiceImpl implements EmployeeService {
         if (employeeRepository.existsByPhoneAndBusinessId(phone, businessId)) {
             throw new BusinessException("Ya existe un empleado con el teléfono '" + phone + "'");
         }
+    }
+
+    private Set<Service> findOwnedServicesOrThrow(Set<Long> serviceIds, Long businessId) {
+        List<Service> services = serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(serviceIds, businessId);
+        if (services.size() != serviceIds.size()) {
+            throw new ResourceNotFoundException(
+                    "Uno o más servicios no existen, no están activos o no pertenecen a este negocio");
+        }
+        return new HashSet<>(services);
     }
 
 }

@@ -7,6 +7,7 @@ import com.victor.appointmentmanager.api.modules.auth.dto.request.LoginRequest;
 import com.victor.appointmentmanager.api.modules.auth.dto.request.RegisterRequest;
 import com.victor.appointmentmanager.api.modules.customers.dto.request.CreateCustomerRequest;
 import com.victor.appointmentmanager.api.modules.employees.dto.request.CreateEmployeeRequest;
+import com.victor.appointmentmanager.api.modules.employees.dto.request.UpdateEmployeeRequest;
 import com.victor.appointmentmanager.api.modules.services.dto.request.CreateServiceRequest;
 import com.victor.appointmentmanager.api.modules.services.dto.request.UpdateServiceRequest;
 import org.junit.jupiter.api.Test;
@@ -22,6 +23,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -122,9 +124,9 @@ class AuthSecurityIntegrationTest {
                 .andExpect(jsonPath("$.data.email").value("valid-token@example.com"));
     }
 
-    private CreateServiceRequest buildCreateServiceRequest() {
+    private CreateServiceRequest buildCreateServiceRequest(String name) {
         CreateServiceRequest request = new CreateServiceRequest();
-        request.setName("Corte de prueba");
+        request.setName(name);
         request.setDurationMinutes(30);
         request.setPrice(new BigDecimal("10.00"));
         request.setColor("#3B82F6");
@@ -132,10 +134,14 @@ class AuthSecurityIntegrationTest {
     }
 
     private long createService(String token) throws Exception {
+        return createService(token, "Corte de prueba");
+    }
+
+    private long createService(String token, String name) throws Exception {
         String response = mockMvc.perform(post("/api/services")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(buildCreateServiceRequest())))
+                        .content(objectMapper.writeValueAsString(buildCreateServiceRequest(name))))
                 .andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString();
         return objectMapper.readTree(response).path("data").path("id").asLong();
@@ -202,6 +208,7 @@ class AuthSecurityIntegrationTest {
         employeeRequest.setPhone("+595981111111");
         employeeRequest.setEmail("juan@example.com");
         employeeRequest.setColor("#3B82F6");
+        employeeRequest.setServiceIds(Set.of(serviceIdB));
 
         String employeeResponse = mockMvc.perform(post("/api/employees")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + tokenB)
@@ -250,6 +257,130 @@ class AuthSecurityIntegrationTest {
         assertThat(schemas.path("CreateCustomerRequest").path("properties").has("businessId")).isFalse();
         assertThat(schemas.path("CreateAppointmentRequest").path("properties").has("businessId")).isFalse();
         assertThat(schemas.path("ConversationRequest").path("properties").has("businessId")).isFalse();
+    }
+
+    @Test
+    void employeeCreationAcceptsServiceIdsAndResponseIncludesAssignedServices() throws Exception {
+        JsonNode owner = register("employee-services@example.com", "Negocio Servicios");
+        String token = owner.path("accessToken").asText();
+
+        long serviceId = createService(token, "Corte Clásico");
+
+        CreateEmployeeRequest employeeRequest = new CreateEmployeeRequest();
+        employeeRequest.setFirstName("Juan");
+        employeeRequest.setLastName("Pérez");
+        employeeRequest.setPhone("+595981234567");
+        employeeRequest.setColor("#3B82F6");
+        employeeRequest.setServiceIds(Set.of(serviceId));
+
+        String response = mockMvc.perform(post("/api/employees")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(employeeRequest)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.services[0].id").value(serviceId))
+                .andExpect(jsonPath("$.data.services[0].name").value("Corte Clásico"))
+                .andReturn().getResponse().getContentAsString();
+        long employeeId = objectMapper.readTree(response).path("data").path("id").asLong();
+
+        mockMvc.perform(get("/api/employees/" + employeeId)
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.services[0].id").value(serviceId));
+    }
+
+    @Test
+    void employeeUpdateReplacesAssignedServicesCompletely() throws Exception {
+        JsonNode owner = register("employee-services-update@example.com", "Negocio Servicios Update");
+        String token = owner.path("accessToken").asText();
+
+        long serviceId1 = createService(token, "Corte");
+        long serviceId2 = createService(token, "Barba");
+
+        CreateEmployeeRequest employeeRequest = new CreateEmployeeRequest();
+        employeeRequest.setFirstName("Juan");
+        employeeRequest.setLastName("Pérez");
+        employeeRequest.setPhone("+595981234568");
+        employeeRequest.setColor("#3B82F6");
+        employeeRequest.setServiceIds(Set.of(serviceId1));
+
+        String createResponse = mockMvc.perform(post("/api/employees")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(employeeRequest)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        long employeeId = objectMapper.readTree(createResponse).path("data").path("id").asLong();
+
+        UpdateEmployeeRequest updateRequest = new UpdateEmployeeRequest();
+        updateRequest.setFirstName("Juan");
+        updateRequest.setLastName("Pérez");
+        updateRequest.setPhone("+595981234568");
+        updateRequest.setColor("#3B82F6");
+        updateRequest.setServiceIds(Set.of(serviceId2));
+
+        mockMvc.perform(put("/api/employees/" + employeeId)
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(updateRequest)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.services[0].id").value(serviceId2))
+                .andExpect(jsonPath("$.data.services.length()").value(1));
+    }
+
+    @Test
+    void employeeCreationRejectsServiceFromAnotherBusiness() throws Exception {
+        JsonNode ownerA = register("employee-cross-a@example.com", "Negocio Cross A");
+        String tokenA = ownerA.path("accessToken").asText();
+
+        JsonNode ownerB = register("employee-cross-b@example.com", "Negocio Cross B");
+        String tokenB = ownerB.path("accessToken").asText();
+
+        long serviceIdB = createService(tokenB, "Servicio B");
+
+        CreateEmployeeRequest employeeRequest = new CreateEmployeeRequest();
+        employeeRequest.setFirstName("Juan");
+        employeeRequest.setLastName("Pérez");
+        employeeRequest.setPhone("+595981234569");
+        employeeRequest.setColor("#3B82F6");
+        employeeRequest.setServiceIds(Set.of(serviceIdB));
+
+        mockMvc.perform(post("/api/employees")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + tokenA)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(employeeRequest)))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void employeeCreationRejectsEmptyServiceIds() throws Exception {
+        JsonNode owner = register("employee-empty-services@example.com", "Negocio Empty");
+        String token = owner.path("accessToken").asText();
+
+        CreateEmployeeRequest employeeRequest = new CreateEmployeeRequest();
+        employeeRequest.setFirstName("Juan");
+        employeeRequest.setLastName("Pérez");
+        employeeRequest.setPhone("+595981234570");
+        employeeRequest.setColor("#3B82F6");
+        employeeRequest.setServiceIds(Set.of());
+
+        mockMvc.perform(post("/api/employees")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(employeeRequest)))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void swaggerSchemaExposesServiceIdsOnEmployeeRequests() throws Exception {
+        String docs = mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode schemas = objectMapper.readTree(docs).path("components").path("schemas");
+
+        assertThat(schemas.path("CreateEmployeeRequest").path("properties").has("serviceIds")).isTrue();
+        assertThat(schemas.path("UpdateEmployeeRequest").path("properties").has("serviceIds")).isTrue();
     }
 
 }
