@@ -22,7 +22,7 @@ public class SystemPromptBuilder {
             INTENT: <una de estas opciones: GREETING, BOOK_APPOINTMENT, RESCHEDULE_APPOINTMENT, CANCEL_APPOINTMENT, CHECK_AVAILABILITY, UNKNOWN>
             CONFIDENCE: <número entre 0.0 y 1.0 que indique qué tan seguro estás de la intención detectada>
             SERVICE_NAME: <nombre del servicio que el usuario mencionó, exactamente como aparece en la información disponible, o NONE si no lo mencionó>
-            START_AT: <fecha y hora que el usuario pidió, en formato ISO-8601 UTC (ejemplo: 2026-08-10T14:00:00Z), o NONE si no fue clara>
+            START_AT: <fecha y hora exactamente como la expresó el usuario, en español, SIN convertir vos la zona horaria (ejemplos: "10 de agosto de 2026 a las 15:00", "mañana a las 10", "el próximo lunes a las 9"). Si el usuario mencionó explícitamente una zona horaria o UTC, incluila tal cual (ejemplo: "10 de agosto de 2026 a las 13:00 UTC"). Nunca calcules ni escribas vos un horario en UTC salvo que el usuario lo haya pedido así explícitamente. O NONE si no fue clara.>
             APPOINTMENT_ID: <número de cita si el usuario lo mencionó explícitamente, o NONE>
             REPLY: <tu respuesta en lenguaje natural para el usuario, puede ocupar varias líneas>
             """;
