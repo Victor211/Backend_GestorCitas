@@ -21,6 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 @org.springframework.stereotype.Service
@@ -55,7 +56,7 @@ public class EmployeeServiceImpl implements EmployeeService {
         Long businessId = currentUserProvider.getCurrentBusinessId();
         Employee employee = findOwnedByIdOrThrow(id, businessId);
 
-        if (!employee.getPhone().equals(request.getPhone())) {
+        if (!Objects.equals(employee.getPhone(), request.getPhone())) {
             assertPhoneIsAvailable(request.getPhone(), businessId);
         }
 
@@ -102,6 +103,9 @@ public class EmployeeServiceImpl implements EmployeeService {
     }
 
     private void assertPhoneIsAvailable(String phone, Long businessId) {
+        if (phone == null) {
+            return;
+        }
         if (employeeRepository.existsByPhoneAndBusinessId(phone, businessId)) {
             throw new BusinessException("Ya existe un empleado con el teléfono '" + phone + "'");
         }

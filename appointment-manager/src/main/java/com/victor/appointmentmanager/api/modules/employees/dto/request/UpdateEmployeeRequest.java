@@ -1,5 +1,6 @@
 package com.victor.appointmentmanager.api.modules.employees.dto.request;
 
+import com.victor.appointmentmanager.api.common.util.StringNormalizer;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -28,11 +29,13 @@ public class UpdateEmployeeRequest {
     @Size(max = 100)
     private String lastName;
 
-    @NotBlank
     @Size(max = 30)
+    @Schema(description = "Teléfono del empleado (opcional).", nullable = true)
     private String phone;
 
     @Email
+    @Size(max = 150)
+    @Schema(description = "Email del empleado (opcional).", nullable = true)
     private String email;
 
     @NotBlank
@@ -44,5 +47,13 @@ public class UpdateEmployeeRequest {
     @Schema(description = "Reemplaza por completo los Services asignados al empleado. "
             + "Deben pertenecer al Business autenticado y estar activos.", example = "[1]")
     private Set<@NotNull Long> serviceIds;
+
+    public void setPhone(String phone) {
+        this.phone = StringNormalizer.blankToNull(phone);
+    }
+
+    public void setEmail(String email) {
+        this.email = StringNormalizer.blankToNull(email);
+    }
 
 }

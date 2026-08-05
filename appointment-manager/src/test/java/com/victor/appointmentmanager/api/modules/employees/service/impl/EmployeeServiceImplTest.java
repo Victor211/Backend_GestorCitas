@@ -359,6 +359,275 @@ class EmployeeServiceImplTest {
     }
 
     @Test
+    void createsEmployeeWithPhoneAndEmail() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setEmail("juan@example.com");
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.existsByPhoneAndBusinessId("0981000000", 1L)).thenReturn(false);
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeMapper.toEntity(request)).thenReturn(employee);
+        when(employeeRepository.save(employee)).thenReturn(employee);
+
+        EmployeeResponse response = new EmployeeResponse();
+        response.setPhone("0981000000");
+        response.setEmail("juan@example.com");
+        when(employeeMapper.toDto(employee)).thenReturn(response);
+
+        EmployeeResponse result = employeeService.create(request);
+
+        assertThat(result.getPhone()).isEqualTo("0981000000");
+        assertThat(result.getEmail()).isEqualTo("juan@example.com");
+    }
+
+    @Test
+    void createsEmployeeWithoutPhone() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setPhone(null);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeMapper.toEntity(request)).thenReturn(employee);
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.create(request);
+
+        verify(employeeRepository, never()).existsByPhoneAndBusinessId(any(), any());
+        verify(employeeRepository).save(employee);
+    }
+
+    @Test
+    void createsEmployeeWithoutEmail() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setEmail(null);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.existsByPhoneAndBusinessId("0981000000", 1L)).thenReturn(false);
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeMapper.toEntity(request)).thenReturn(employee);
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.create(request);
+
+        verify(employeeRepository).save(employee);
+    }
+
+    @Test
+    void createsEmployeeWithoutPhoneAndEmail() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setPhone(null);
+        request.setEmail(null);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeMapper.toEntity(request)).thenReturn(employee);
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.create(request);
+
+        verify(employeeRepository, never()).existsByPhoneAndBusinessId(any(), any());
+        verify(employeeRepository).save(employee);
+    }
+
+    @Test
+    void emptyPhoneIsNormalizedToNullOnCreateRequest() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setPhone("");
+
+        assertThat(request.getPhone()).isNull();
+    }
+
+    @Test
+    void emptyEmailIsNormalizedToNullOnCreateRequest() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setEmail("");
+
+        assertThat(request.getEmail()).isNull();
+    }
+
+    @Test
+    void whitespaceOnlyPhoneAndEmailAreNormalizedToNullOnCreateRequest() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setPhone("   ");
+        request.setEmail("   ");
+
+        assertThat(request.getPhone()).isNull();
+        assertThat(request.getEmail()).isNull();
+    }
+
+    @Test
+    void whitespaceOnlyPhoneAndEmailAreNormalizedToNullOnUpdateRequest() {
+        UpdateEmployeeRequest request = new UpdateEmployeeRequest();
+        request.setPhone("   ");
+        request.setEmail("   ");
+
+        assertThat(request.getPhone()).isNull();
+        assertThat(request.getEmail()).isNull();
+    }
+
+    @Test
+    void duplicatePhoneIsOnlyValidatedWhenPhoneHasValue() {
+        CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));
+        request.setPhone(null);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeMapper.toEntity(request)).thenReturn(employee);
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.create(request);
+
+        verify(employeeRepository, never()).existsByPhoneAndBusinessId(any(), any());
+    }
+
+    @Test
+    void twoEmployeesWithNullPhoneAreAllowed() {
+        CreateEmployeeRequest firstRequest = buildCreateRequest(Set.of(4L));
+        firstRequest.setPhone(null);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeMapper.toEntity(firstRequest)).thenReturn(employee);
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.create(firstRequest);
+
+        Employee secondEmployee = new Employee();
+        secondEmployee.setId(9L);
+        secondEmployee.setBusiness(business);
+        CreateEmployeeRequest secondRequest = buildCreateRequest(Set.of(4L));
+        secondRequest.setPhone(null);
+        when(employeeMapper.toEntity(secondRequest)).thenReturn(secondEmployee);
+        when(employeeRepository.save(secondEmployee)).thenReturn(secondEmployee);
+        when(employeeMapper.toDto(secondEmployee)).thenReturn(new EmployeeResponse());
+
+        employeeService.create(secondRequest);
+
+        verify(employeeRepository, never()).existsByPhoneAndBusinessId(any(), any());
+        verify(employeeRepository).save(employee);
+        verify(employeeRepository).save(secondEmployee);
+    }
+
+    @Test
+    void updateRemovesExistingPhoneWhenSetToNull() {
+        UpdateEmployeeRequest request = new UpdateEmployeeRequest();
+        request.setFirstName("Juan");
+        request.setLastName("Pérez");
+        request.setPhone(null);
+        request.setColor("#3B82F6");
+        request.setServiceIds(Set.of(4L));
+
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.update(5L, request);
+
+        verify(employeeMapper).updateEntityFromRequest(request, employee);
+        verify(employeeRepository, never()).existsByPhoneAndBusinessId(any(), any());
+    }
+
+    @Test
+    void updateRemovesExistingEmailWhenSetToNull() {
+        employee.setEmail("juan@example.com");
+
+        UpdateEmployeeRequest request = new UpdateEmployeeRequest();
+        request.setFirstName("Juan");
+        request.setLastName("Pérez");
+        request.setPhone("0981000000");
+        request.setEmail(null);
+        request.setColor("#3B82F6");
+        request.setServiceIds(Set.of(4L));
+
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.update(5L, request);
+
+        verify(employeeMapper).updateEntityFromRequest(request, employee);
+    }
+
+    @Test
+    void updateAddsPhoneThatWasPreviouslyNull() {
+        employee.setPhone(null);
+
+        UpdateEmployeeRequest request = new UpdateEmployeeRequest();
+        request.setFirstName("Juan");
+        request.setLastName("Pérez");
+        request.setPhone("0987654321");
+        request.setColor("#3B82F6");
+        request.setServiceIds(Set.of(4L));
+
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.existsByPhoneAndBusinessId("0987654321", 1L)).thenReturn(false);
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.update(5L, request);
+
+        verify(employeeRepository).existsByPhoneAndBusinessId("0987654321", 1L);
+        verify(employeeRepository).save(employee);
+    }
+
+    @Test
+    void updateAddsEmailThatWasPreviouslyNull() {
+        UpdateEmployeeRequest request = new UpdateEmployeeRequest();
+        request.setFirstName("Juan");
+        request.setLastName("Pérez");
+        request.setPhone("0981000000");
+        request.setEmail("juan@example.com");
+        request.setColor("#3B82F6");
+        request.setServiceIds(Set.of(4L));
+
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findAllByIdInAndBusinessIdAndActiveTrue(Set.of(4L), 1L))
+                .thenReturn(List.of(serviceA));
+        when(employeeRepository.save(employee)).thenReturn(employee);
+        when(employeeMapper.toDto(employee)).thenReturn(new EmployeeResponse());
+
+        employeeService.update(5L, request);
+
+        verify(employeeMapper).updateEntityFromRequest(request, employee);
+        verify(employeeRepository).save(employee);
+    }
+
+    @Test
+    void throwsBusinessExceptionWhenUpdatingPhoneToAnAlreadyUsedOne() {
+        UpdateEmployeeRequest request = new UpdateEmployeeRequest();
+        request.setFirstName("Juan");
+        request.setLastName("Pérez");
+        request.setPhone("0987654321");
+        request.setColor("#3B82F6");
+        request.setServiceIds(Set.of(4L));
+
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(5L, 1L)).thenReturn(Optional.of(employee));
+        when(employeeRepository.existsByPhoneAndBusinessId("0987654321", 1L)).thenReturn(true);
+
+        assertThatThrownBy(() -> employeeService.update(5L, request))
+                .isInstanceOf(BusinessException.class);
+
+        verify(employeeRepository, never()).save(any());
+    }
+
+    @Test
     void checksPhoneUniquenessScopedToAuthenticatedBusinessOnly() {
         when(currentUserProvider.getCurrentBusinessId()).thenReturn(2L);
         CreateEmployeeRequest request = buildCreateRequest(Set.of(4L));

@@ -35,7 +35,7 @@ public class Employee extends AuditableEntity {
     @Column(nullable = false, length = 100)
     private String lastName;
 
-    @Column(nullable = false, length = 30)
+    @Column(length = 30)
     private String phone;
 
     @Column(length = 150)
