@@ -13,6 +13,8 @@ public interface CustomerRepository extends JpaRepository<Customer, Long> {
 
     Optional<Customer> findByIdAndBusinessIdAndActiveTrue(Long id, Long businessId);
 
+    long countByBusinessIdAndActiveTrue(Long businessId);
+
     Optional<Customer> findByBusinessIdAndPhoneAndActiveTrue(Long businessId, String phone);
 
     boolean existsByBusinessIdAndPhone(Long businessId, String phone);

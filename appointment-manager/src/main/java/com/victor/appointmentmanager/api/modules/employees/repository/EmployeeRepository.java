@@ -11,6 +11,8 @@ public interface EmployeeRepository extends JpaRepository<Employee, Long> {
 
     Optional<Employee> findByIdAndBusinessIdAndActiveTrue(Long id, Long businessId);
 
+    long countByBusinessIdAndActiveTrue(Long businessId);
+
     Page<Employee> findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(Long businessId, String firstName,
                                                                                   Pageable pageable);
 

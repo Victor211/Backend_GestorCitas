@@ -51,6 +51,24 @@ Además de las variables de base de datos (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_
 
 Ninguna de las dos tiene valor por defecto: si faltan, la aplicación no arranca.
 
+## CORS
+
+El backend expone su configuración de CORS mediante una única variable de entorno:
+
+| Variable | Descripción |
+|---|---|
+| `CORS_ALLOWED_ORIGINS` | Lista de orígenes permitidos, separados por coma. Por defecto (si no se define) es `http://localhost:5173`. |
+
+Ejemplo para desarrollo local (frontend en Vite, puertos 5173 y 5175):
+
+```
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5175
+```
+
+La configuración se aplica globalmente a `/**` (no se usa `@CrossOrigin` en los controllers) y permite los métodos `GET, POST, PUT, PATCH, DELETE, OPTIONS` y los headers `Authorization, Content-Type, Accept, X-Requested-With, X-Hub-Signature-256`. `allowCredentials` está deshabilitado, por lo que no se envían cookies ni credenciales de sesión entre orígenes: la autenticación sigue siendo vía JWT en el header `Authorization`.
+
+**En producción**, `CORS_ALLOWED_ORIGINS` debe configurarse con el dominio real del frontend (por ejemplo `https://app.mi-dominio.com`). Nunca debe usarse `*` como origen permitido.
+
 ## Autenticación
 
 El backend usa autenticación **stateless con JWT** (Bearer token). El flujo es:
@@ -153,3 +171,44 @@ Por el momento no existe una pantalla/endpoint dedicado para esto (fuera de alca
 ### Advertencia
 
 No incluyas `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET` ni ningún otro secreto real en el repositorio, en el README, ni en commits. Configuralos únicamente como variables de entorno en tu entorno de ejecución.
+
+## Dashboard API
+
+`GET /api/dashboard` devuelve, en una única llamada, las métricas y próximas citas que necesita el Dashboard del frontend. Requiere JWT; el `Business` siempre se obtiene del token autenticado (nunca por query, path ni body), por lo que un usuario nunca puede ver datos de otro negocio.
+
+```json
+{
+  "success": true,
+  "message": "Operación exitosa",
+  "data": {
+    "todayAppointments": 3,
+    "activeCustomers": 12,
+    "activeEmployees": 4,
+    "activeServices": 6,
+    "upcomingAppointments": [
+      {
+        "id": 10,
+        "customerId": 2,
+        "customerName": "Cristian Benitez",
+        "employeeId": 1,
+        "employeeName": "Juan Gómez",
+        "serviceId": 1,
+        "serviceName": "Corte Premium",
+        "startAt": "2026-08-05T13:00:00Z",
+        "endAt": "2026-08-05T14:00:00Z",
+        "status": "CONFIRMED"
+      }
+    ]
+  }
+}
+```
+
+**Métricas incluidas**: cantidad de citas de hoy, clientes activos, empleados activos, servicios activos y el listado de próximas citas.
+
+**Zona horaria**: "hoy" se calcula con la zona horaria del `Business` (`business.timezone`), nunca con la zona del servidor ni asumiendo UTC. Si `business.timezone` no es un `ZoneId` válido, el endpoint responde con un error de negocio controlado en lugar de devolver métricas potencialmente incorrectas.
+
+**Citas de hoy**: cuenta únicamente las citas del negocio con `startAt` dentro del día local actual y estado `PENDING` o `CONFIRMED` (excluye `CANCELLED`, `COMPLETED` y `NO_SHOW`).
+
+**Próximas citas**: citas con `startAt` igual o posterior al momento actual y estado `PENDING` o `CONFIRMED`, ordenadas por `startAt` ascendente y limitadas a 5 resultados (no se pagina, es solo una vista resumida para el Dashboard).
+
+Todas las fechas (`startAt`, `endAt`) se expresan como `Instant` en UTC, igual que en el resto de la API.

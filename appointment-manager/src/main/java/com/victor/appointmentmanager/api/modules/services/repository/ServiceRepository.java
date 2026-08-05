@@ -13,6 +13,8 @@ public interface ServiceRepository extends JpaRepository<Service, Long> {
 
     Optional<Service> findByIdAndBusinessIdAndActiveTrue(Long id, Long businessId);
 
+    long countByBusinessIdAndActiveTrue(Long businessId);
+
     Page<Service> findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(Long businessId, String name,
                                                                             Pageable pageable);
 
