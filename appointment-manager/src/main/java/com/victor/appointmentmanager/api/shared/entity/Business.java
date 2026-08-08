@@ -25,9 +25,8 @@ public class Business extends AuditableEntity {
     @Column(nullable = false, length = 150)
     private String name;
 
-    @NotBlank
     @Size(max = 30)
-    @Column(nullable = false, length = 30)
+    @Column(length = 30)
     private String phone;
 
     @Email

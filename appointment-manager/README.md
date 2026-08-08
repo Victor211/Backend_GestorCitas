@@ -212,3 +212,45 @@ No incluyas `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET` ni ningún otro secre
 **Próximas citas**: citas con `startAt` igual o posterior al momento actual y estado `PENDING` o `CONFIRMED`, ordenadas por `startAt` ascendente y limitadas a 5 resultados (no se pagina, es solo una vista resumida para el Dashboard).
 
 Todas las fechas (`startAt`, `endAt`) se expresan como `Instant` en UTC, igual que en el resto de la API.
+
+## Business Settings API
+
+Endpoints para que la pantalla Settings del frontend consulte y actualice la configuración general del `Business` autenticado. Requieren JWT; el `Business` se obtiene exclusivamente a partir del usuario autenticado (nunca por `businessId` recibido en path, query o body), por lo que un usuario nunca puede ver ni modificar datos de otro negocio.
+
+`GET /api/settings/business`
+
+```json
+{
+  "success": true,
+  "message": "Operación exitosa",
+  "data": {
+    "id": 1,
+    "name": "Peluquería Elegance",
+    "phone": "+595981123456",
+    "email": "contacto@peluqueriaelegance.com",
+    "address": "Asunción, Paraguay",
+    "timezone": "America/Asuncion",
+    "whatsappConfigured": false
+  }
+}
+```
+
+`PUT /api/settings/business`
+
+```json
+{
+  "name": "Peluquería Elegance",
+  "phone": "+595981123456",
+  "email": "contacto@peluqueriaelegance.com",
+  "address": "Asunción, Paraguay",
+  "timezone": "America/Asuncion"
+}
+```
+
+**Campos editables**: `name`, `phone`, `email`, `address`, `timezone`. `id`, `active`, `createdAt`, `updatedAt` y los identificadores de WhatsApp (`whatsappBusinessAccountId`, `whatsappPhoneNumberId`) no se pueden modificar desde este endpoint. `phone`, `email` y `address` son opcionales: enviarlos vacíos o solo con espacios los convierte a `null` (se centraliza en `StringNormalizer`, la misma utilidad ya usada por Employees).
+
+**Validación de `timezone`**: es obligatorio y se valida con `ZoneId.of(timezone)` (sin lista hardcodeada de zonas). Si no es un `ZoneId` reconocido por `java.time`, responde `400` con el mensaje `"La zona horaria indicada no es válida"`. Al actualizarse, el resto del sistema (Dashboard, AI, interpretación de fechas de Appointments) usa naturalmente la nueva zona a través del `Business` persistido — las citas ya existentes no se recalculan ni se modifican (siguen almacenadas como `Instant` UTC).
+
+**`whatsappConfigured`**: booleano calculado, `true` únicamente cuando el `Business` tiene un `whatsappPhoneNumberId` configurado (el identificador mínimo que usa el backend para enrutar webhooks y enviar mensajes). Este endpoint nunca expone `whatsappBusinessAccountId` ni `whatsappPhoneNumberId` como valores editables, y jamás devuelve secretos: `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN` ni `OPENAI_API_KEY` no se gestionan ni se exponen desde esta API — siguen siendo exclusivamente variables de entorno del backend.
+
+**Aislamiento multi-tenant**: el flujo es siempre JWT → usuario autenticado → `businessId` → `Business`; el request de actualización no tiene ningún campo `businessId`, por lo que es estructuralmente imposible modificar el negocio de otro usuario.
