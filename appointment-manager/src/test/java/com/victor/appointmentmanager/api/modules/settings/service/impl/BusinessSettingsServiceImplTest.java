@@ -3,6 +3,7 @@ package com.victor.appointmentmanager.api.modules.settings.service.impl;
 import com.victor.appointmentmanager.api.modules.settings.dto.request.UpdateBusinessSettingsRequest;
 import com.victor.appointmentmanager.api.modules.settings.dto.response.BusinessSettingsResponse;
 import com.victor.appointmentmanager.api.modules.settings.mapper.BusinessSettingsMapper;
+import com.victor.appointmentmanager.api.modules.settings.mapper.BusinessSettingsMapperImpl;
 import com.victor.appointmentmanager.api.security.CurrentUserProvider;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
@@ -264,6 +265,33 @@ class BusinessSettingsServiceImplTest {
         assertThat(declaredFieldNames)
                 .containsExactlyInAnyOrder("id", "name", "phone", "email", "address", "timezone",
                         "whatsappConfigured");
+    }
+
+    // Regresión del bug reportado: PUT con phone/email/address = null debía devolver 500 por una
+    // restricción NOT NULL obsoleta en la base de datos. Con el mapper real (no mockeado), este test
+    // reproduce el flujo completo del service y confirma que el Business termina con los tres campos en
+    // null, sin NullPointerException ni valores ignorados.
+    @Test
+    void updateSettingsWithAllOptionalFieldsNullSetsThemToNullUsingRealMapper() {
+        BusinessSettingsServiceImpl serviceWithRealMapper = new BusinessSettingsServiceImpl(
+                businessRepository, new BusinessSettingsMapperImpl(), currentUserProvider);
+
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setPhone(null);
+        request.setEmail(null);
+        request.setAddress(null);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(businessRepository.save(business)).thenReturn(business);
+
+        BusinessSettingsResponse result = serviceWithRealMapper.updateSettings(request);
+
+        assertThat(business.getPhone()).isNull();
+        assertThat(business.getEmail()).isNull();
+        assertThat(business.getAddress()).isNull();
+        assertThat(result.getPhone()).isNull();
+        assertThat(result.getEmail()).isNull();
+        assertThat(result.getAddress()).isNull();
     }
 
 }

@@ -211,6 +211,275 @@ class BusinessSettingsControllerIntegrationTest {
                 .andExpect(jsonPath("$.data.name").value("Negocio A Actualizado"));
     }
 
+    // 2. phone null -> 200.
+    @Test
+    void putSettingsWithNullPhoneReturnsOk() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setPhone(null);
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").doesNotExist());
+    }
+
+    // 3. email null -> 200.
+    @Test
+    void putSettingsWithNullEmailReturnsOk() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setEmail(null);
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.email").doesNotExist());
+    }
+
+    // 4. address null -> 200.
+    @Test
+    void putSettingsWithNullAddressReturnsOk() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setAddress(null);
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.address").doesNotExist());
+    }
+
+    // 5. los tres null -> 200 (escenario exacto reportado en el bug).
+    @Test
+    void putSettingsWithPhoneEmailAndAddressAllNullReturnsOk() throws Exception {
+        String rawBody = """
+                {
+                  "name": "Peluqueria Elegance",
+                  "phone": null,
+                  "email": null,
+                  "address": null,
+                  "timezone": "America/Asuncion"
+                }
+                """;
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(rawBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").doesNotExist())
+                .andExpect(jsonPath("$.data.email").doesNotExist())
+                .andExpect(jsonPath("$.data.address").doesNotExist());
+
+        // 12. GET posterior devuelve null para los tres.
+        mockMvc.perform(get("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").doesNotExist())
+                .andExpect(jsonPath("$.data.email").doesNotExist())
+                .andExpect(jsonPath("$.data.address").doesNotExist());
+    }
+
+    // 6. phone "" -> persiste null.
+    @Test
+    void putSettingsWithEmptyPhonePersistsNull() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setPhone("");
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").doesNotExist());
+    }
+
+    // 7. email "" -> persiste null.
+    @Test
+    void putSettingsWithEmptyEmailPersistsNull() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setEmail("");
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.email").doesNotExist());
+    }
+
+    // 8. address "   " -> persiste null.
+    @Test
+    void putSettingsWithBlankAddressPersistsNull() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setAddress("   ");
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.address").doesNotExist());
+    }
+
+    // 9. Quitar phone que anteriormente tenía valor.
+    @Test
+    void removesPhoneThatPreviouslyHadValue() throws Exception {
+        UpdateBusinessSettingsRequest withPhone = buildValidRequest();
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(withPhone)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").value(withPhone.getPhone()));
+
+        UpdateBusinessSettingsRequest withoutPhone = buildValidRequest();
+        withoutPhone.setPhone(null);
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(withoutPhone)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").doesNotExist());
+
+        mockMvc.perform(get("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").doesNotExist());
+    }
+
+    // 10. Quitar email que anteriormente tenía valor.
+    @Test
+    void removesEmailThatPreviouslyHadValue() throws Exception {
+        UpdateBusinessSettingsRequest withEmail = buildValidRequest();
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(withEmail)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.email").value(withEmail.getEmail()));
+
+        UpdateBusinessSettingsRequest withoutEmail = buildValidRequest();
+        withoutEmail.setEmail(null);
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(withoutEmail)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.email").doesNotExist());
+
+        mockMvc.perform(get("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.email").doesNotExist());
+    }
+
+    // 11. Quitar address que anteriormente tenía valor.
+    @Test
+    void removesAddressThatPreviouslyHadValue() throws Exception {
+        UpdateBusinessSettingsRequest withAddress = buildValidRequest();
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(withAddress)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.address").value(withAddress.getAddress()));
+
+        UpdateBusinessSettingsRequest withoutAddress = buildValidRequest();
+        withoutAddress.setAddress(null);
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(withoutAddress)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.address").doesNotExist());
+
+        mockMvc.perform(get("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.address").doesNotExist());
+    }
+
+    // Tras quedar en null, los valores pueden volver a cargarse normalmente.
+    @Test
+    void fieldsCanBeSetAgainAfterBeingRemoved() throws Exception {
+        UpdateBusinessSettingsRequest cleared = buildValidRequest();
+        cleared.setPhone(null);
+        cleared.setEmail(null);
+        cleared.setAddress(null);
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(cleared)))
+                .andExpect(status().isOk());
+
+        UpdateBusinessSettingsRequest restored = buildValidRequest();
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(restored)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").value(restored.getPhone()))
+                .andExpect(jsonPath("$.data.email").value(restored.getEmail()))
+                .andExpect(jsonPath("$.data.address").value(restored.getAddress()));
+    }
+
+    // 13. Email inválido con contenido -> 400.
+    @Test
+    void putSettingsWithInvalidEmailContentReturnsBadRequest() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setEmail("not-an-email");
+
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    // 15. /api/auth/me continúa funcionando tras el update con campos null.
+    @Test
+    void authMeContinuesWorkingAfterNullUpdate() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setPhone(null);
+        request.setEmail(null);
+        request.setAddress(null);
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get("/api/auth/me")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.businessName").value(request.getName()));
+    }
+
+    // 16. Dashboard continúa funcionando tras el update con campos null.
+    @Test
+    void dashboardContinuesWorkingAfterNullUpdate() throws Exception {
+        UpdateBusinessSettingsRequest request = buildValidRequest();
+        request.setPhone(null);
+        request.setEmail(null);
+        request.setAddress(null);
+        mockMvc.perform(put("/api/settings/business")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get("/api/dashboard")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.activeCustomers").value(0));
+    }
+
     // Ningún secreto (tokens/keys) aparece nunca en la respuesta.
     @Test
     void responseNeverExposesWhatsappOrOpenAiSecrets() throws Exception {

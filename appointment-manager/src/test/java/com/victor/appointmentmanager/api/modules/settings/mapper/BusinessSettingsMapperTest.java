@@ -101,4 +101,27 @@ class BusinessSettingsMapperTest {
         assertThat(business.getTimezone()).isEqualTo("America/Asuncion");
     }
 
+    // Regresión: un valor null en el request debe propagarse como null al entity (PUT representa el estado
+    // completo editable), nunca ser ignorado ni provocar NullPointerException.
+    @Test
+    void updateEntityFromRequestSetsFieldsToNullWhenRequestHasNullValues() {
+        Business business = buildBusiness();
+        assertThat(business.getPhone()).isNotNull();
+        assertThat(business.getEmail()).isNotNull();
+        assertThat(business.getAddress()).isNotNull();
+
+        UpdateBusinessSettingsRequest request = new UpdateBusinessSettingsRequest();
+        request.setName("Nuevo Nombre");
+        request.setPhone(null);
+        request.setEmail(null);
+        request.setAddress(null);
+        request.setTimezone("America/Asuncion");
+
+        mapper.updateEntityFromRequest(request, business);
+
+        assertThat(business.getPhone()).isNull();
+        assertThat(business.getEmail()).isNull();
+        assertThat(business.getAddress()).isNull();
+    }
+
 }
