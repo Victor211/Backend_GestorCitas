@@ -23,33 +23,68 @@ Backend del proyecto Appointment Manager, construido con Spring Boot.
 - Motor conversacional propio (OpenAI vía RestClient, aislado detrás de `AiProvider`)
 - Integración con WhatsApp Cloud API de Meta (vía RestClient, aislado detrás de `WhatsAppClient`)
 
-## Cómo ejecutar el proyecto
+## Configuración
 
-Desde la carpeta `appointment-manager`:
+El backend se configura íntegramente por variables de entorno — el mismo jar funciona en desarrollo local, en un servidor Linux o en cualquier otro entorno, cambiando únicamente esas variables (nunca recompilando). No se usan archivos `.properties`; toda la configuración vive en YAML (`application.yml` + un `application-{perfil}.yml` por entorno).
+
+Perfil activo vía `SPRING_PROFILES_ACTIVE` (por defecto `dev` si no se define):
+
+| Perfil | Uso | Particularidades |
+|---|---|---|
+| `dev` | Desarrollo local | `show-sql: true` |
+| `prod` | Producción | `show-sql: false` |
+| `test` | Suite de tests | No se usa en la práctica: los tests con `@SpringBootTest` reemplazan el datasource por H2 embebido vía `@AutoConfigureTestDatabase`, independientemente del perfil activo. Ver [docs/development.md](docs/development.md). |
+
+Copiar [`.env.example`](.env.example) a `.env` y completar los valores para desarrollo local. El detalle completo de cada variable (con ejemplos y cuáles son secretas) está en **[docs/environment.md](docs/environment.md)**.
+
+Guías paso a paso:
+
+- **[docs/development.md](docs/development.md)** — cómo correr el backend y los tests localmente, cómo probar Swagger.
+- **[docs/deployment.md](docs/deployment.md)** — despliegue conceptual en servidor Linux + Apache (reverse proxy) + systemd + HTTPS.
+
+## Desarrollo local
+
+Desde la carpeta `appointment-manager`, con las variables de entorno cargadas (ver [docs/development.md](docs/development.md)):
 
 ```bash
 mvn spring-boot:run
 ```
 
-O compilando el jar y ejecutándolo:
+La aplicación se levanta en `SERVER_ADDRESS:SERVER_PORT` (por defecto `0.0.0.0:8080`).
+
+Swagger UI: `http://localhost:8080/swagger-ui/index.html`
+API Docs (OpenAPI crudo): `http://localhost:8080/v3/api-docs`
+
+## Build
 
 ```bash
 mvn clean package
-java -jar target/appointment-manager-0.0.1-SNAPSHOT.jar
 ```
 
-La aplicación se levanta en el puerto `8080`.
+Resultado: `target/appointment-manager.jar`.
+
+## Ejecución
+
+```bash
+java -jar target/appointment-manager.jar
+```
+
+Requiere las mismas variables de entorno que `mvn spring-boot:run`. Es el mismo artefacto que se despliega en producción (ver [docs/deployment.md](docs/deployment.md)); el comportamiento cambia solo según las variables de entorno presentes.
 
 ## Variables de entorno
 
-Además de las variables de base de datos (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`), el proyecto requiere:
+Resumen rápido — ver **[docs/environment.md](docs/environment.md)** para la tabla completa con ejemplos y cuáles son secretas.
 
 | Variable | Descripción |
 |---|---|
+| `SPRING_PROFILES_ACTIVE` | Perfil activo: `dev`, `prod` o `test`. Por defecto `dev`. |
+| `SERVER_ADDRESS` / `SERVER_PORT` | Interfaz y puerto del servidor embebido. En desarrollo `SERVER_ADDRESS=0.0.0.0`; en producción, detrás de Apache, `SERVER_ADDRESS=127.0.0.1`. Por defecto `0.0.0.0` / `8080`. |
+| `HIBERNATE_DDL_AUTO` | Estrategia de schema de Hibernate. Por defecto `update` (sin Flyway ni Liquibase). |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Conexión a PostgreSQL. Sin valores por defecto: si falta alguna, la aplicación no arranca. |
 | `JWT_SECRET` | Clave usada para firmar los tokens JWT (HMAC). No debe commitearse un valor real al repositorio; se sugiere un string aleatorio largo (32+ caracteres) para desarrollo local. |
 | `JWT_EXPIRATION` | Duración del access token, **expresada en milisegundos** (única unidad usada en todo el proyecto). Ejemplo: `3600000` = 1 hora. |
 
-Ninguna de las dos tiene valor por defecto: si faltan, la aplicación no arranca.
+`JWT_SECRET` y `JWT_EXPIRATION` no tienen valor por defecto: si faltan, la aplicación no arranca.
 
 ## CORS
 

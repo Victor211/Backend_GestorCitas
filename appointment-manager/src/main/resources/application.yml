@@ -2,13 +2,13 @@ spring:
   application:
     name: appointment-manager
   profiles:
-    active: dev
+    active: ${SPRING_PROFILES_ACTIVE:dev}
   mandatory-file-encoding: UTF-8
   jackson:
     time-zone: UTC
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: ${HIBERNATE_DDL_AUTO:update}
     properties:
       hibernate:
         format_sql: true
@@ -23,7 +23,8 @@ spring:
       read-timeout: ${WHATSAPP_READ_TIMEOUT_MS:15000}ms
 
 server:
-  port: 8080
+  address: ${SERVER_ADDRESS:0.0.0.0}
+  port: ${SERVER_PORT:8080}
   servlet:
     encoding:
       charset: UTF-8
