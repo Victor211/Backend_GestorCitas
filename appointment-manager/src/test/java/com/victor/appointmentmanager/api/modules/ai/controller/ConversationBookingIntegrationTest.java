@@ -42,11 +42,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Reproduce el bug ET-016: la IA confirmaba una reserva ("reply" de confirmación) sin que
- * AppointmentService hubiera persistido ningún Appointment. Estas pruebas ejercitan el flujo
- * conversacional completo (ConversationServiceImpl real + AppointmentServiceImpl real + H2)
- * sustituyendo únicamente el AiProvider por un mock controlado, para verificar que
- * ConversationResponse.appointmentId siempre corresponde a una cita realmente persistida.
+ * Ejercita el flujo conversacional completo (ConversationServiceImpl real + AppointmentServiceImpl
+ * real + H2) sustituyendo únicamente el AiProvider por un mock controlado. Desde el tuning
+ * conversacional, ninguna reserva se crea en el mismo turno en el que se completan los datos:
+ * primero se propone una confirmación y solo un "Sí" posterior (segundo turno) persiste el
+ * Appointment. Los tests existentes se adaptaron a ese segundo turno; los nuevos (CASO A-D) cubren
+ * cliente nuevo multi-turno, cliente existente en un solo mensaje, rechazo y cambio de dato
+ * durante la confirmación.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -174,15 +176,15 @@ class ConversationBookingIntegrationTest {
                 .andExpect(status().isCreated());
     }
 
-    private void stubAiBookingReply(Instant startAt) {
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
+    private void stubAiBookingReply(String userMessage, Instant startAt) {
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq(userMessage))).thenReturn(
                 "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: " + startAt
-                        + "\nCONFIDENCE: 0.9\nREPLY: Tu cita ha sido confirmada.");
+                        + "\nCONFIDENCE: 0.9\nREPLY: no importa, el backend decide el mensaje final.");
     }
 
-    private String converse(String message) throws Exception {
+    private String converse(String phone, String message) throws Exception {
         ConversationRequest request = new ConversationRequest();
-        request.setCustomerPhone(customerPhone);
+        request.setCustomerPhone(phone);
         request.setMessage(message);
 
         return mockMvc.perform(post("/api/ai/conversation")
@@ -193,16 +195,32 @@ class ConversationBookingIntegrationTest {
                 .andReturn().getResponse().getContentAsString();
     }
 
+    private String converse(String message) throws Exception {
+        return converse(customerPhone, message);
+    }
+
+    private JsonNode confirm(String phone) throws Exception {
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("Sí")))
+                .thenReturn("INTENT: UNKNOWN\nCONFIDENCE: 0.0\nREPLY: no debería usarse");
+        String response = converse(phone, "Sí");
+        return objectMapper.readTree(response).path("data");
+    }
+
+    private long proposeAndConfirm(String phone, String bookingMessage, Instant startAt) throws Exception {
+        stubAiBookingReply(bookingMessage, startAt);
+        String proposalResponse = converse(phone, bookingMessage);
+        JsonNode proposal = objectMapper.readTree(proposalResponse).path("data");
+        assertThat(proposal.path("reply").asText()).contains("¿Confirmás?");
+        assertThat(proposal.path("appointmentId").isNull()).isTrue();
+
+        JsonNode confirmed = confirm(phone);
+        return confirmed.path("appointmentId").asLong();
+    }
+
     @Test
-    void bookAppointmentIntentPersistsConfirmedAppointmentWithRealId() throws Exception {
-        stubAiBookingReply(slotStart);
+    void bookAppointmentIsNotCreatedUntilExplicitConfirmationThenPersistsWithRealId() throws Exception {
+        long appointmentId = proposeAndConfirm(customerPhone, "Quiero reservar un corte el lunes a las 9", slotStart);
 
-        String response = converse("Quiero reservar un corte el lunes a las 9");
-        JsonNode data = objectMapper.readTree(response).path("data");
-
-        assertThat(data.path("intent").asText()).isEqualTo("BOOK_APPOINTMENT");
-        assertThat(data.path("reply").asText()).contains("confirmada");
-        long appointmentId = data.path("appointmentId").asLong();
         assertThat(appointmentId).isPositive();
 
         mockMvc.perform(get("/api/appointments?page=0&size=10")
@@ -215,23 +233,19 @@ class ConversationBookingIntegrationTest {
 
     @Test
     void cancelledAppointmentDoesNotBlockNewBookingAndCreatesNewAppointment() throws Exception {
-        stubAiBookingReply(slotStart);
-
-        String firstResponse = converse("Quiero reservar un corte el lunes a las 9");
-        long firstAppointmentId = objectMapper.readTree(firstResponse).path("data").path("appointmentId").asLong();
+        long firstAppointmentId = proposeAndConfirm(
+                customerPhone, "Quiero reservar un corte el lunes a las 9", slotStart);
         assertThat(firstAppointmentId).isPositive();
 
         mockMvc.perform(patch("/api/appointments/" + firstAppointmentId + "/cancel")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
                 .andExpect(status().isOk());
 
-        String secondResponse = converse("Quiero reservar otro corte el lunes a las 9");
-        JsonNode secondData = objectMapper.readTree(secondResponse).path("data");
-        long secondAppointmentId = secondData.path("appointmentId").asLong();
+        long secondAppointmentId = proposeAndConfirm(
+                customerPhone, "Quiero reservar otro corte el lunes a las 9", slotStart);
 
         assertThat(secondAppointmentId).isPositive();
         assertThat(secondAppointmentId).isNotEqualTo(firstAppointmentId);
-        assertThat(secondData.path("reply").asText()).contains("confirmada");
 
         mockMvc.perform(get("/api/appointments?page=0&size=10")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
@@ -250,17 +264,22 @@ class ConversationBookingIntegrationTest {
     }
 
     @Test
-    void unavailableSlotDoesNotConfirmBookingDespiteAiConfirmationText() throws Exception {
-        stubAiBookingReply(slotStart);
-        converse("Quiero reservar un corte el lunes a las 9");
+    void slotTakenBetweenProposalAndConfirmationIsRevalidatedAndDoesNotDoubleBook() throws Exception {
+        long firstAppointmentId = proposeAndConfirm(
+                customerPhone, "Quiero reservar un corte el lunes a las 9", slotStart);
+        assertThat(firstAppointmentId).isPositive();
 
-        // El modelo redacta el mismo texto de "confirmada" aunque el horario ya esté ocupado;
-        // la regla de negocio (superposición) debe rechazar la segunda reserva igualmente.
-        String secondResponse = converse("Quiero reservar otro corte el lunes a las 9");
-        JsonNode secondData = objectMapper.readTree(secondResponse).path("data");
+        // Un segundo cliente propone el mismo horario (todavía no confirma).
+        String otherPhone = customerPhone + "9";
+        createCustomer(otherPhone);
+        stubAiBookingReply("Quiero reservar otro corte el lunes a las 9", slotStart);
+        String secondProposalResponse = converse(otherPhone, "Quiero reservar otro corte el lunes a las 9");
+        JsonNode secondProposal = objectMapper.readTree(secondProposalResponse).path("data");
+        assertThat(secondProposal.path("reply").asText()).contains("¿Confirmás?");
 
-        assertThat(secondData.path("appointmentId").isNull()).isTrue();
-        assertThat(secondData.path("reply").asText()).doesNotContain("Tu cita ha sido confirmada.");
+        // Al confirmar, la revalidación detecta que el horario ya no está libre.
+        JsonNode secondConfirmed = confirm(otherPhone);
+        assertThat(secondConfirmed.path("appointmentId").isNull()).isTrue();
 
         mockMvc.perform(get("/api/appointments?page=0&size=10")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
@@ -271,24 +290,28 @@ class ConversationBookingIntegrationTest {
     @Test
     void localTimeStatedByCustomerIsNotPersistedAsThatSameUtcTime() throws Exception {
         // Reproduce el bug ET-018: la IA (mock) devuelve la hora exactamente como la dijo el
-        // cliente, sin convertirla ("10 de agosto de 2026 a las 15:00" es un lunes, cubierto
-        // por el horario del empleado). El backend debe interpretarla en America/Asuncion,
-        // NO como si fuera UTC.
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 10 de agosto de 2026 a las 15:00\n"
+        // cliente, sin convertirla. Se usa el próximo lunes (cubierto por el horario del
+        // empleado creado en setUp) para que la fecha nunca quede en el pasado. El backend debe
+        // interpretarla en America/Asuncion, NO como si fuera UTC.
+        LocalDate futureMonday = LocalDate.now(ZONE).with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+        String spanishDate = java.time.format.DateTimeFormatter
+                .ofPattern("d 'de' MMMM 'de' uuuu", java.util.Locale.of("es", "ES"))
+                .format(futureMonday);
+        String message = "Quiero reservar un Corte Premium con Juan Gómez el " + spanishDate + " a las 15:00.";
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq(message))).thenReturn(
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: " + spanishDate + " a las 15:00\n"
                         + "CONFIDENCE: 0.9\nREPLY: no importa, el backend decide el mensaje final.");
 
-        String response = converse(
-                "Quiero reservar un Corte Premium con Juan Gómez el 10 de agosto de 2026 a las 15:00.");
-        JsonNode data = objectMapper.readTree(response).path("data");
+        String proposalResponse = converse(message);
+        JsonNode proposal = objectMapper.readTree(proposalResponse).path("data");
+        assertThat(proposal.path("reply").asText()).contains("15:00");
 
-        long appointmentId = data.path("appointmentId").asLong();
+        JsonNode confirmed = confirm(customerPhone);
+        long appointmentId = confirmed.path("appointmentId").asLong();
         assertThat(appointmentId).isPositive();
-        assertThat(data.path("reply").asText()).contains("15:00");
 
-        Instant expectedUtc = ZonedDateTime.of(
-                LocalDate.of(2026, 8, 10), LocalTime.of(15, 0), ZONE).toInstant();
-        assertThat(expectedUtc).isNotEqualTo(Instant.parse("2026-08-10T15:00:00Z"));
+        Instant expectedUtc = ZonedDateTime.of(futureMonday, LocalTime.of(15, 0), ZONE).toInstant();
+        assertThat(expectedUtc).isNotEqualTo(Instant.parse(futureMonday + "T15:00:00Z"));
 
         String appointmentResponse = mockMvc.perform(get("/api/appointments/" + appointmentId)
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
@@ -298,8 +321,130 @@ class ConversationBookingIntegrationTest {
                 objectMapper.readTree(appointmentResponse).path("data").path("startAt").asText());
 
         assertThat(persistedStartAt).isEqualTo(expectedUtc);
-        assertThat(persistedStartAt).isNotEqualTo(Instant.parse("2026-08-10T15:00:00Z"));
+        assertThat(persistedStartAt).isNotEqualTo(Instant.parse(futureMonday + "T15:00:00Z"));
         assertThat(persistedStartAt.atZone(ZONE).toLocalTime()).isEqualTo(LocalTime.of(15, 0));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CASO A: cliente nuevo, multi-turno completo (identificación + slot-filling + confirmación)
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void newCustomerFullConversationCreatesExactlyOneAppointment() throws Exception {
+        String newPhone = customerPhone + "-nuevo";
+
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("Hola, quiero reservar un turno")))
+                .thenReturn("INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        String firstResponse = converse(newPhone, "Hola, quiero reservar un turno");
+        JsonNode first = objectMapper.readTree(firstResponse).path("data");
+        assertThat(first.path("reply").asText()).contains("¿Cuál es tu nombre?");
+        assertThat(first.path("reply").asText().toLowerCase()).doesNotContain("teléfono");
+
+        String secondResponse = converse(newPhone, "María López");
+        JsonNode second = objectMapper.readTree(secondResponse).path("data");
+        assertThat(second.path("reply").asText().toLowerCase()).doesNotContain("teléfono");
+
+        stubAiBookingReply("Quiero un corte el lunes a las 9", slotStart);
+        String thirdResponse = converse(newPhone, "Quiero un corte el lunes a las 9");
+        JsonNode third = objectMapper.readTree(thirdResponse).path("data");
+        assertThat(third.path("reply").asText()).contains("¿Confirmás?");
+        assertThat(third.path("appointmentId").isNull()).isTrue();
+
+        JsonNode confirmed = confirm(newPhone);
+        long appointmentId = confirmed.path("appointmentId").asLong();
+        assertThat(appointmentId).isPositive();
+
+        mockMvc.perform(get("/api/appointments?page=0&size=10")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalElements").value(1));
+
+        mockMvc.perform(get("/api/customers/by-phone").param("phone", newPhone)
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.firstName").value("María"))
+                .andExpect(jsonPath("$.data.phone").value(newPhone));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CASO B: cliente existente, mensaje único ya completo -> solo pregunta confirmación
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void existingCustomerCompleteMessageOnlyAsksForConfirmationThenBooks() throws Exception {
+        String message = "Quiero reservar el lunes a las 9 con Juan para un Corte";
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq(message))).thenReturn(
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nEMPLOYEE_NAME: Juan\nSTART_AT: " + slotStart
+                        + "\nCONFIDENCE: 0.9\nREPLY: no importa");
+
+        String response = converse(message);
+        JsonNode data = objectMapper.readTree(response).path("data");
+
+        assertThat(data.path("reply").asText())
+                .doesNotContain("¿Cuál es tu nombre?")
+                .contains("¿Confirmás?");
+        assertThat(data.path("appointmentId").isNull()).isTrue();
+
+        JsonNode confirmed = confirm(customerPhone);
+        assertThat(confirmed.path("appointmentId").asLong()).isPositive();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CASO C: negativa -> no crea cita, el conteo de Appointments no cambia
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void rejectingTheProposalDoesNotChangeAppointmentCount() throws Exception {
+        stubAiBookingReply("Quiero reservar un corte el lunes a las 9", slotStart);
+        String proposalResponse = converse("Quiero reservar un corte el lunes a las 9");
+        assertThat(objectMapper.readTree(proposalResponse).path("data").path("reply").asText())
+                .contains("¿Confirmás?");
+
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("No")))
+                .thenReturn("INTENT: UNKNOWN\nCONFIDENCE: 0.0\nREPLY: no debería usarse");
+        String rejectionResponse = converse("No");
+        JsonNode rejected = objectMapper.readTree(rejectionResponse).path("data");
+        assertThat(rejected.path("appointmentId").isNull()).isTrue();
+
+        mockMvc.perform(get("/api/appointments?page=0&size=10")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalElements").value(0));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CASO D: cambio de horario durante la confirmación -> no crea la propuesta vieja
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void changingTheProposedTimeDuringConfirmationBooksTheNewTimeNotTheOldOne() throws Exception {
+        stubAiBookingReply("Quiero reservar un corte el lunes a las 9", slotStart);
+        converse("Quiero reservar un corte el lunes a las 9");
+
+        String changeMessage = "Mejor a las 11";
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq(changeMessage))).thenReturn(
+                "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 11\nCONFIDENCE: 0.6\nREPLY: no importa");
+        String changeResponse = converse(changeMessage);
+        JsonNode changed = objectMapper.readTree(changeResponse).path("data");
+        assertThat(changed.path("reply").asText()).contains("11:00").contains("¿Confirmás?");
+        assertThat(changed.path("appointmentId").isNull()).isTrue();
+
+        JsonNode confirmed = confirm(customerPhone);
+        long appointmentId = confirmed.path("appointmentId").asLong();
+        assertThat(appointmentId).isPositive();
+
+        String appointmentResponse = mockMvc.perform(get("/api/appointments/" + appointmentId)
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        Instant persistedStartAt = Instant.parse(
+                objectMapper.readTree(appointmentResponse).path("data").path("startAt").asText());
+        assertThat(persistedStartAt.atZone(ZONE).toLocalTime()).isEqualTo(LocalTime.of(11, 0));
+
+        mockMvc.perform(get("/api/appointments?page=0&size=10")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalElements").value(1));
     }
 
 }

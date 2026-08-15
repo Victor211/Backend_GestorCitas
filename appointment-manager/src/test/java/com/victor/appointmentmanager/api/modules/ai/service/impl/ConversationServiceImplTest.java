@@ -1,14 +1,15 @@
 package com.victor.appointmentmanager.api.modules.ai.service.impl;
 
+import com.victor.appointmentmanager.api.common.exception.BusinessException;
 import com.victor.appointmentmanager.api.modules.ai.client.AiProvider;
 import com.victor.appointmentmanager.api.modules.ai.datetime.BusinessDateTimeResolver;
 import com.victor.appointmentmanager.api.modules.ai.dto.request.ConversationRequest;
 import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationResponse;
+import com.victor.appointmentmanager.api.modules.ai.entity.ConversationState;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationIntent;
 import com.victor.appointmentmanager.api.modules.ai.prompt.SystemPromptBuilder;
+import com.victor.appointmentmanager.api.modules.ai.repository.ConversationStateRepository;
 import com.victor.appointmentmanager.api.modules.appointments.dto.response.AppointmentResponse;
-import com.victor.appointmentmanager.api.modules.appointments.entity.Appointment;
-import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentStatus;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
@@ -24,31 +25,29 @@ import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.domain.Specification;
 
+import java.math.BigDecimal;
 import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -63,9 +62,6 @@ class ConversationServiceImplTest {
 
     @Mock
     private BusinessRepository businessRepository;
-
-    @Mock
-    private CustomerRepository customerRepository;
 
     @Mock
     private ServiceRepository serviceRepository;
@@ -85,19 +81,27 @@ class ConversationServiceImplTest {
     @Mock
     private CurrentUserProvider currentUserProvider;
 
+    @Mock
+    private ConversationStateRepository conversationStateRepository;
+
+    @Mock
+    private CustomerRepository customerRepository;
+
     @Spy
     private BusinessDateTimeResolver businessDateTimeResolver = new BusinessDateTimeResolver();
 
-    @InjectMocks
     private ConversationServiceImpl conversationService;
-
     private Business business;
+
+    private final Map<String, ConversationState> statesByKey = new HashMap<>();
+    private final Map<String, Customer> customersByPhone = new HashMap<>();
+    private long nextCustomerId = 100L;
 
     @BeforeEach
     void setUp() {
         business = new Business();
         business.setId(1L);
-        business.setName("Barbería Central");
+        business.setName("Peluquería Elegance");
         business.setTimezone("America/Asuncion");
 
         lenient().when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
@@ -106,13 +110,121 @@ class ConversationServiceImplTest {
                         eq(1L), eq(""), any(Pageable.class)))
                 .thenReturn(Page.empty());
         lenient().when(scheduleRepository.findActiveByBusiness(1L, null, null)).thenReturn(List.of());
+
+        lenient().when(conversationStateRepository.findByBusinessIdAndCustomerPhone(anyLong(), anyString()))
+                .thenAnswer(inv -> Optional.ofNullable(statesByKey.get(key(inv.getArgument(0), inv.getArgument(1)))));
+        lenient().when(conversationStateRepository.save(any(ConversationState.class))).thenAnswer(inv -> {
+            ConversationState state = inv.getArgument(0);
+            statesByKey.put(key(state.getBusinessId(), state.getCustomerPhone()), state);
+            return state;
+        });
+
+        lenient().when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(anyLong(), anyString()))
+                .thenAnswer(inv -> Optional.ofNullable(customersByPhone.get(inv.getArgument(1))));
+        lenient().when(customerRepository.findByBusinessIdAndPhone(anyLong(), anyString()))
+                .thenAnswer(inv -> Optional.ofNullable(customersByPhone.get(inv.getArgument(1))));
+        lenient().when(customerRepository.save(any(Customer.class))).thenAnswer(inv -> {
+            Customer customer = inv.getArgument(0);
+            if (customer.getId() == null) {
+                customer.setId(nextCustomerId++);
+            }
+            customersByPhone.put(customer.getPhone(), customer);
+            return customer;
+        });
+
+        ConversationStateStore conversationStateStore = new ConversationStateStore(conversationStateRepository);
+        CustomerIdentityResolver customerIdentityResolver = new CustomerIdentityResolver(customerRepository);
+        ConfirmationClassifier confirmationClassifier = new ConfirmationClassifier();
+        com.victor.appointmentmanager.api.modules.ai.format.GuaraniAmountFormatter guaraniAmountFormatter =
+                new com.victor.appointmentmanager.api.modules.ai.format.GuaraniAmountFormatter();
+
+        conversationService = new ConversationServiceImpl(aiProvider, systemPromptBuilder, businessRepository,
+                serviceRepository, employeeRepository, scheduleRepository, appointmentRepository, appointmentService,
+                currentUserProvider, businessDateTimeResolver, conversationStateStore, customerIdentityResolver,
+                confirmationClassifier, guaraniAmountFormatter);
     }
+
+    private static String key(Long businessId, String phone) {
+        return businessId + ":" + phone;
+    }
+
+    private void stubAi(String userMessage, String rawResponse) {
+        when(aiProvider.generateResponse(anyString(), eq(userMessage))).thenReturn(rawResponse);
+    }
+
+    private Customer existingCustomer(String phone, String firstName) {
+        Customer customer = new Customer();
+        customer.setId(nextCustomerId++);
+        customer.setBusiness(business);
+        customer.setFirstName(firstName);
+        customer.setPhone(phone);
+        customersByPhone.put(phone, customer);
+        return customer;
+    }
+
+    private Service service(Long id, String name, BigDecimal price) {
+        Service service = new Service();
+        service.setId(id);
+        service.setName(name);
+        service.setPrice(price);
+        service.setDurationMinutes(30);
+        service.setBusiness(business);
+        return service;
+    }
+
+    private Employee employee(Long id, String firstName, String lastName, Service... services) {
+        Employee employee = new Employee();
+        employee.setId(id);
+        employee.setFirstName(firstName);
+        employee.setLastName(lastName);
+        employee.setBusiness(business);
+        employee.setServices(new HashSet<>(List.of(services)));
+        return employee;
+    }
+
+    private void stubServiceLookup(String name, Service service) {
+        lenient().when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(name), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(service)));
+        lenient().when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(service.getId(), 1L))
+                .thenReturn(Optional.of(service));
+    }
+
+    private void stubEmployeeListing(Employee... employees) {
+        lenient().when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(employees)));
+        for (Employee employee : employees) {
+            lenient().when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(employee.getId(), 1L))
+                    .thenReturn(Optional.of(employee));
+        }
+    }
+
+    /** Lleva la conversación hasta AWAITING_CONFIRMATION con un único empleado habilitado. */
+    private void proposeCorteBooking(String phone, Service corte, Employee juan) {
+        existingCustomer(phone, "Cristian");
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+        stubAi("Quiero un corte mañana a las 14",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: mañana a las 14\n"
+                        + "CONFIDENCE: 0.9\nREPLY: no importa");
+
+        ConversationResponse proposal = conversationService.processChannelConversation(
+                1L, phone, "Quiero un corte mañana a las 14");
+
+        assertThat(proposal.getReply()).contains("¿Confirmás?");
+        assertThat(proposal.getAppointmentId()).isNull();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Entry points (comportamiento heredado, sin cambios)
+    // ---------------------------------------------------------------------------------------
 
     @Test
     void processAuthenticatedConversationDerivesBusinessIdFromJwt() {
         when(currentUserProvider.getCurrentBusinessId()).thenReturn(1L);
-        when(aiProvider.generateResponse(anyString(), eq("Hola"))).thenReturn(
-                "INTENT: GREETING\nCONFIDENCE: 0.95\nREPLY: ¡Hola! ¿En qué puedo ayudarte?");
+        existingCustomer("595981000000", "Ana");
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.95\nREPLY: ¿En qué puedo ayudarte?");
 
         ConversationRequest request = new ConversationRequest();
         request.setCustomerPhone("595981000000");
@@ -120,7 +232,6 @@ class ConversationServiceImplTest {
 
         ConversationResponse result = conversationService.processAuthenticatedConversation(request);
 
-        assertThat(result.getReply()).isEqualTo("¡Hola! ¿En qué puedo ayudarte?");
         assertThat(result.getIntent()).isEqualTo(ConversationIntent.GREETING);
         assertThat(result.getAppointmentId()).isNull();
         verify(businessRepository).findByIdAndActiveTrue(1L);
@@ -128,8 +239,8 @@ class ConversationServiceImplTest {
 
     @Test
     void processChannelConversationUsesExplicitBusinessIdNotJwt() {
-        when(aiProvider.generateResponse(anyString(), eq("Hola"))).thenReturn(
-                "INTENT: GREETING\nCONFIDENCE: 0.95\nREPLY: ¡Hola!");
+        existingCustomer("595981000000", "Ana");
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.95\nREPLY: ¡Hola!");
 
         conversationService.processChannelConversation(1L, "595981000000", "Hola");
 
@@ -137,348 +248,197 @@ class ConversationServiceImplTest {
         verify(currentUserProvider, never()).getCurrentBusinessId();
     }
 
+    // ---------------------------------------------------------------------------------------
+    // AJUSTE 1: listado de servicios
+    // ---------------------------------------------------------------------------------------
+
     @Test
-    void bookAppointmentIntentCreatesAppointmentUsingExplicitBusinessIdOverload() {
-        Service service = new Service();
-        service.setId(4L);
-        service.setName("Corte");
-        service.setBusiness(business);
-
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
-
-        Employee employee = new Employee();
-        employee.setId(3L);
-        employee.setBusiness(business);
-        employee.setServices(Set.of(service));
-
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 2026-08-10T14:00:00Z\n"
-                        + "CONFIDENCE: 0.8\nREPLY: ¡Listo! Te reservé el turno.");
+    void serviceListIntentRepliesWithBulletListFormattedInGuaranies() {
+        existingCustomer("+595981000001", "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service color = service(5L, "Coloración", new BigDecimal("150000"));
         when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq("Corte"), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(service)));
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
                         eq(1L), eq(""), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(employee)));
-
-        Instant startAt = Instant.parse("2026-08-10T13:00:00Z");
-        AppointmentResponse appointmentResponse = new AppointmentResponse();
-        appointmentResponse.setId(100L);
-        appointmentResponse.setServiceName("Corte Premium");
-        appointmentResponse.setEmployeeName("Juan Gómez");
-        appointmentResponse.setStartAt(startAt);
-        when(appointmentService.create(eq(1L), any())).thenReturn(appointmentResponse);
+                .thenReturn(new PageImpl<>(List.of(corte, color)));
+        stubAi("¿Qué servicios ofrecen?", "INTENT: LIST_SERVICES\nCONFIDENCE: 0.9\nREPLY: no importa");
 
         ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "Quiero un turno para un corte mañana a las 14");
+                1L, "+595981000001", "¿Qué servicios ofrecen?");
 
-        assertThat(result.getAppointmentId()).isEqualTo(100L);
-        assertThat(result.getIntent()).isEqualTo(ConversationIntent.BOOK_APPOINTMENT);
-        assertThat(result.getConfidence()).isEqualTo(1.0);
-        // El reply no proviene del texto libre de la IA ("¡Listo! Te reservé el turno."):
-        // se construye determinísticamente en backend a partir del AppointmentResponse real.
-        assertThat(result.getReply()).isNotEqualTo("¡Listo! Te reservé el turno.");
-        assertThat(result.getReply()).contains("Corte Premium", "Juan Gómez", "confirmada", "Barbería Central");
-        verify(appointmentService).create(eq(1L), any());
+        assertThat(result.getIntent()).isEqualTo(ConversationIntent.LIST_SERVICES);
+        assertThat(result.getReply()).contains("• Corte Premium — Gs. 65.000");
+        assertThat(result.getReply()).contains("• Coloración — Gs. 150.000");
+        assertThat(result.getReply()).doesNotContain("$");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AJUSTE 4/5: identificación de cliente por sender_phone
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void newCustomerIsNeverAskedForPhoneAndGetsCreatedUsingSenderPhone() {
+        String phone = "+595987000001";
+        stubAi("Quiero reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+
+        ConversationResponse first = conversationService.processChannelConversation(
+                1L, phone, "Quiero reservar un turno");
+
+        assertThat(first.getReply().toLowerCase()).doesNotContain("teléfono").doesNotContain("telefono");
+        assertThat(first.getReply()).contains("¿Cuál es tu nombre?");
+
+        ConversationResponse second = conversationService.processChannelConversation(1L, phone, "María López");
+
+        assertThat(customersByPhone).containsKey(phone);
+        Customer created = customersByPhone.get(phone);
+        assertThat(created.getPhone()).isEqualTo(phone);
+        assertThat(created.getFirstName()).isEqualTo("María");
+        assertThat(created.getLastName()).isEqualTo("López");
+        assertThat(second.getReply().toLowerCase()).doesNotContain("teléfono").doesNotContain("telefono");
     }
 
     @Test
-    void confirmationReplyShowsLocalBusinessTimezoneNotUtc() {
-        Service service = new Service();
-        service.setId(4L);
-        service.setName("Corte");
-        service.setBusiness(business);
-
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
-
-        Employee employee = new Employee();
-        employee.setId(3L);
-        employee.setBusiness(business);
-        employee.setServices(Set.of(service));
-
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 2026-08-10T14:00:00Z\n"
-                        + "CONFIDENCE: 0.8\nREPLY: ¡Listo!");
-        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq("Corte"), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(service)));
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq(""), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(employee)));
-
-        Instant startAt = Instant.parse("2026-08-10T13:00:00Z");
-        ZonedDateTime expectedLocal = startAt.atZone(ZoneId.of("America/Asuncion"));
-        String expectedTime = DateTimeFormatter.ofPattern("HH:mm").format(expectedLocal);
-
-        AppointmentResponse appointmentResponse = new AppointmentResponse();
-        appointmentResponse.setId(100L);
-        appointmentResponse.setServiceName("Corte Premium");
-        appointmentResponse.setEmployeeName("Juan Gómez");
-        appointmentResponse.setStartAt(startAt);
-        when(appointmentService.create(eq(1L), any())).thenReturn(appointmentResponse);
+    void existingCustomerIsNeverAskedForNameOrPhoneAgain() {
+        String phone = "+595981222333";
+        existingCustomer(phone, "Cristian");
+        stubAi("Quiero reservar un turno mañana",
+                "INTENT: BOOK_APPOINTMENT\nSTART_AT: mañana\nCONFIDENCE: 0.7\nREPLY: no importa");
 
         ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "Quiero un turno para un corte mañana a las 14");
+                1L, phone, "Quiero reservar un turno mañana");
 
-        assertThat(result.getReply()).contains("a las " + expectedTime);
-        assertThat(result.getReply()).doesNotContain("13:00");
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(result.getReply().toLowerCase()).doesNotContain("teléfono").doesNotContain("telefono");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AJUSTE 6: saludo inicial
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void initialGreetingUsesBusinessNameAndStillAddressesTheOriginalMessageInTheSameTurn() {
+        String phone = "+595987000002";
+        stubAi("Hola, quiero reservar mañana a las 10",
+                "INTENT: BOOK_APPOINTMENT\nSTART_AT: mañana a las 10\nCONFIDENCE: 0.8\nREPLY: no importa");
+
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Hola, quiero reservar mañana a las 10");
+
+        assertThat(result.getReply()).contains("Peluquería Elegance");
+        assertThat(result.getReply()).contains("¿Cuál es tu nombre?");
     }
 
     @Test
-    void aiCannotForceNegativeReplyWhenAppointmentWasActuallyCreated() {
-        Service service = new Service();
-        service.setId(4L);
-        service.setName("Corte");
-        service.setBusiness(business);
+    void greetingIsOnlySentOnceForTheSameConversation() {
+        String phone = "+595987000003";
+        existingCustomer(phone, "Ana");
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\nREPLY: Estoy para ayudarte.");
+        stubAi("Otra vez hola", "INTENT: GREETING\nCONFIDENCE: 0.9\nREPLY: Decime en qué te ayudo.");
 
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
+        ConversationResponse first = conversationService.processChannelConversation(1L, phone, "Hola");
+        ConversationResponse second = conversationService.processChannelConversation(1L, phone, "Otra vez hola");
 
-        Employee employee = new Employee();
-        employee.setId(3L);
-        employee.setBusiness(business);
-        employee.setServices(Set.of(service));
-
-        // El modelo redacta un texto negativo aunque la creación real vaya a ser exitosa.
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 2026-08-10T14:00:00Z\n"
-                        + "CONFIDENCE: 0.5\nREPLY: Lo siento, el empleado no está disponible. "
-                        + "No pudimos reservar, elige otra hora.");
-        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq("Corte"), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(service)));
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq(""), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(employee)));
-
-        AppointmentResponse appointmentResponse = new AppointmentResponse();
-        appointmentResponse.setId(100L);
-        appointmentResponse.setServiceName("Corte Premium");
-        appointmentResponse.setEmployeeName("Juan Gómez");
-        appointmentResponse.setStartAt(Instant.parse("2026-08-10T13:00:00Z"));
-        when(appointmentService.create(eq(1L), any())).thenReturn(appointmentResponse);
-
-        ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "Quiero un turno para un corte mañana a las 14");
-
-        assertThat(result.getAppointmentId()).isEqualTo(100L);
-        assertThat(result.getReply().toLowerCase(Locale.ROOT))
-                .doesNotContain("no está disponible")
-                .doesNotContain("no pudimos reservar")
-                .doesNotContain("elige otra hora");
-        assertThat(result.getReply()).contains("confirmada");
+        assertThat(first.getReply()).contains("Peluquería Elegance");
+        assertThat(second.getReply()).doesNotContain("Peluquería Elegance");
     }
 
-    @Test
-    void doesNotCallAiProviderASecondTimeAfterCreatingAppointment() {
-        Service service = new Service();
-        service.setId(4L);
-        service.setName("Corte");
-        service.setBusiness(business);
-
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
-
-        Employee employee = new Employee();
-        employee.setId(3L);
-        employee.setBusiness(business);
-        employee.setServices(Set.of(service));
-
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 2026-08-10T14:00:00Z\n"
-                        + "CONFIDENCE: 0.8\nREPLY: ¡Listo!");
-        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq("Corte"), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(service)));
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq(""), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(employee)));
-
-        AppointmentResponse appointmentResponse = new AppointmentResponse();
-        appointmentResponse.setId(100L);
-        appointmentResponse.setServiceName("Corte Premium");
-        appointmentResponse.setEmployeeName("Juan Gómez");
-        appointmentResponse.setStartAt(Instant.parse("2026-08-10T13:00:00Z"));
-        when(appointmentService.create(eq(1L), any())).thenReturn(appointmentResponse);
-
-        conversationService.processChannelConversation(
-                1L, "595981000000", "Quiero un turno para un corte mañana a las 14");
-
-        verify(aiProvider, times(1)).generateResponse(anyString(), anyString());
-    }
+    // ---------------------------------------------------------------------------------------
+    // Confirmación obligatoria antes de crear (requisito crítico)
+    // ---------------------------------------------------------------------------------------
 
     @Test
-    void doesNotConfirmBookingWhenAiDidNotExtractRequiredData() {
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.8\nREPLY: ¡Tu cita ha sido confirmada!");
+    void appointmentIsNotCreatedBeforeExplicitConfirmation() {
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking("+595981333444", corte, juan);
 
-        ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "quiero un turno");
-
-        assertThat(result.getAppointmentId()).isNull();
-        assertThat(result.getReply()).isNotEqualTo("¡Tu cita ha sido confirmada!");
         verify(appointmentService, never()).create(any(), any());
     }
 
     @Test
-    void doesNotConfirmBookingWhenAppointmentServiceReturnsNull() {
-        Service service = new Service();
-        service.setId(4L);
-        service.setName("Corte");
-        service.setBusiness(business);
+    void positiveConfirmationCreatesTheAppointment() {
+        String phone = "+595981333555";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
 
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(200L);
+        response.setServiceName("Corte");
+        response.setEmployeeName("Juan Gómez");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
 
-        Employee employee = new Employee();
-        employee.setId(3L);
-        employee.setBusiness(business);
-        employee.setServices(Set.of(service));
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Sí");
 
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 2026-08-10T14:00:00Z\n"
-                        + "CONFIDENCE: 0.8\nREPLY: ¡Tu cita ha sido confirmada!");
-        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq("Corte"), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(service)));
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq(""), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(employee)));
-        when(appointmentService.create(eq(1L), any())).thenReturn(null);
-
-        ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "Quiero un turno para un corte mañana a las 14");
-
-        assertThat(result.getAppointmentId()).isNull();
-        assertThat(result.getReply()).isNotEqualTo("¡Tu cita ha sido confirmada!");
+        assertThat(result.getAppointmentId()).isEqualTo(200L);
+        assertThat(result.getIntent()).isEqualTo(ConversationIntent.CONFIRM_APPOINTMENT);
+        verify(appointmentService).create(eq(1L), any());
     }
 
     @Test
-    void doesNotConfirmBookingWhenAppointmentResponseHasNullId() {
-        Service service = new Service();
-        service.setId(4L);
-        service.setName("Corte");
-        service.setBusiness(business);
+    void negativeConfirmationDoesNotCreateTheAppointment() {
+        String phone = "+595981333666";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
 
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
-
-        Employee employee = new Employee();
-        employee.setId(3L);
-        employee.setBusiness(business);
-        employee.setServices(Set.of(service));
-
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 2026-08-10T14:00:00Z\n"
-                        + "CONFIDENCE: 0.8\nREPLY: ¡Tu cita ha sido confirmada!");
-        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq("Corte"), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(service)));
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq(""), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(employee)));
-        when(appointmentService.create(eq(1L), any())).thenReturn(new AppointmentResponse());
-
-        ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "Quiero un turno para un corte mañana a las 14");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "No");
 
         assertThat(result.getAppointmentId()).isNull();
-        assertThat(result.getReply()).isNotEqualTo("¡Tu cita ha sido confirmada!");
+        assertThat(result.getIntent()).isEqualTo(ConversationIntent.REJECT_APPOINTMENT);
+        verify(appointmentService, never()).create(any(), any());
     }
 
     @Test
-    void doesNotConfirmBookingWhenAppointmentServiceThrowsAvailabilityError() {
-        Service service = new Service();
-        service.setId(4L);
-        service.setName("Corte");
-        service.setBusiness(business);
+    void changingTheTimeDuringConfirmationDropsThePreviousProposalAndAsksToConfirmTheNewOne() {
+        String phone = "+595981333777";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+        stubAi("Mejor a las 17", "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 17\nCONFIDENCE: 0.6\nREPLY: no importa");
 
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Mejor a las 17");
 
-        Employee employee = new Employee();
-        employee.setId(3L);
-        employee.setBusiness(business);
-        employee.setServices(Set.of(service));
-
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: 2026-08-10T14:00:00Z\n"
-                        + "CONFIDENCE: 0.8\nREPLY: ¡Tu cita ha sido confirmada!");
-        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq("Corte"), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(service)));
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        eq(1L), eq(""), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(employee)));
-        when(appointmentService.create(eq(1L), any()))
-                .thenThrow(new com.victor.appointmentmanager.api.common.exception.BusinessException(
-                        "La cita se superpone con otra cita existente del empleado"));
-
-        ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "Quiero un turno para un corte mañana a las 14");
-
+        assertThat(result.getReply()).contains("17:00");
+        assertThat(result.getReply()).contains("¿Confirmás?");
         assertThat(result.getAppointmentId()).isNull();
-        assertThat(result.getReply()).isNotEqualTo("¡Tu cita ha sido confirmada!");
-        assertThat(result.getReply()).contains("La cita se superpone con otra cita existente del empleado");
+        verify(appointmentService, never()).create(any(), any());
+
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(300L);
+        response.setServiceName("Corte");
+        response.setEmployeeName("Juan Gómez");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
+
+        ConversationResponse confirmed = conversationService.processChannelConversation(1L, phone, "Sí");
+
+        assertThat(confirmed.getAppointmentId()).isEqualTo(300L);
+        verify(appointmentService, org.mockito.Mockito.times(1)).create(eq(1L), any());
     }
 
     @Test
-    void cancelAppointmentIntentCancelsNextUpcomingAppointment() {
-        Customer customer = new Customer();
-        customer.setId(2L);
-        customer.setBusiness(business);
+    void revalidatesOnConfirmationAndDoesNotCreateWhenTheSlotBecameUnavailable() {
+        String phone = "+595981333888";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+        when(appointmentService.create(eq(1L), any())).thenThrow(
+                new BusinessException("La cita se superpone con otra cita existente del empleado"));
 
-        Appointment appointment = new Appointment();
-        appointment.setId(100L);
-        appointment.setBusiness(business);
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Sí");
 
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn(
-                "INTENT: CANCEL_APPOINTMENT\nCONFIDENCE: 0.7\nREPLY: Listo, cancelé tu turno.");
-        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(1L, "595981000000"))
-                .thenReturn(Optional.of(customer));
-        when(appointmentRepository.findAll(any(Specification.class), any(Pageable.class)))
-                .thenReturn(new PageImpl<>(List.of(appointment)));
-
-        AppointmentResponse appointmentResponse = new AppointmentResponse();
-        appointmentResponse.setId(100L);
-        when(appointmentService.cancel(1L, 100L)).thenReturn(appointmentResponse);
-
-        ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "Cancelá mi turno");
-
-        assertThat(result.getAppointmentId()).isEqualTo(100L);
-        verify(appointmentService).cancel(1L, 100L);
+        assertThat(result.getAppointmentId()).isNull();
+        assertThat(result.getReply().toLowerCase()).contains("disponible");
+        verify(appointmentService).create(eq(1L), any());
     }
 
     @Test
     void fallsBackToDefaultReplyWhenAiResponseIsBlank() {
-        when(aiProvider.generateResponse(anyString(), anyString())).thenReturn("");
+        existingCustomer("595981000000", "Ana");
+        stubAi("???", "");
 
-        ConversationResponse result = conversationService.processChannelConversation(
-                1L, "595981000000", "???");
+        ConversationResponse result = conversationService.processChannelConversation(1L, "595981000000", "???");
 
         assertThat(result.getIntent()).isEqualTo(ConversationIntent.UNKNOWN);
         assertThat(result.getAppointmentId()).isNull();

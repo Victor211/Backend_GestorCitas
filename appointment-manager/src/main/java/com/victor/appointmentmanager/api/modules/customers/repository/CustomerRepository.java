@@ -17,6 +17,8 @@ public interface CustomerRepository extends JpaRepository<Customer, Long> {
 
     Optional<Customer> findByBusinessIdAndPhoneAndActiveTrue(Long businessId, String phone);
 
+    Optional<Customer> findByBusinessIdAndPhone(Long businessId, String phone);
+
     boolean existsByBusinessIdAndPhone(Long businessId, String phone);
 
     @Query("""

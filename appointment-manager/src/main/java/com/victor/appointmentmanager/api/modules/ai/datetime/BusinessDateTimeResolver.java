@@ -1,6 +1,8 @@
 package com.victor.appointmentmanager.api.modules.ai.datetime;
 
 import com.victor.appointmentmanager.api.common.exception.BusinessException;
+import com.victor.appointmentmanager.api.modules.ai.exception.AmbiguousTimeException;
+import com.victor.appointmentmanager.api.modules.ai.exception.MissingTimeException;
 import org.springframework.stereotype.Component;
 
 import java.time.DateTimeException;
@@ -48,12 +50,25 @@ public class BusinessDateTimeResolver {
             .withResolverStyle(ResolverStyle.STRICT);
 
     private static final Pattern EXPLICIT_UTC_SUFFIX = Pattern.compile("(?i)^(.*?)\\s+UTC$");
-    private static final Pattern TIME_SUFFIX = Pattern.compile("(?i)a las\\s+(\\d{1,2})(?::(\\d{2}))?\\s*$");
-    private static final Pattern TOMORROW_PREFIX = Pattern.compile("(?i)^mañana\\s+");
-    private static final Pattern TODAY_PREFIX = Pattern.compile("(?i)^hoy\\s+");
+    private static final Pattern TIME_SUFFIX = Pattern.compile("(?i)a las\\s+(\\d{1,2})(?::(\\d{2}))?");
+    private static final Pattern PM_MARKER = Pattern.compile("(?i)\\b(?:de|por|esta)\\s+(?:la\\s+)?(?:tarde|noche)\\b");
+    private static final Pattern AM_MARKER = Pattern.compile("(?i)\\b(?:de|por)\\s+(?:la\\s+)?mañana\\b");
+    /**
+     * Rango de horas que se consideran genuinamente ambiguas sin contexto adicional. Se acota a
+     * 1-8 (en vez de 1-11) a propósito: en el uso cotidiano de un negocio, "a las 9/10/11" casi
+     * siempre se entiende como AM incluso sin aclaración, mientras que "a las 1-8" es ambiguo con
+     * más frecuencia real (podría ser la 1pm-8pm). Esto evita pedir aclaraciones innecesarias en
+     * el caso común ("el próximo lunes a las 9", "mañana a las 10").
+     */
+    private static final int AMBIGUOUS_HOUR_MIN = 1;
+    private static final int AMBIGUOUS_HOUR_MAX = 8;
+    private static final Pattern TOMORROW_PREFIX = Pattern.compile("(?i)^mañana(?:\\s+|$)");
+    private static final Pattern TODAY_PREFIX = Pattern.compile("(?i)^hoy(?:\\s+|$)");
     private static final Pattern NEXT_WEEKDAY_PREFIX =
-            Pattern.compile("(?i)^(?:el\\s+)?pr[oó]ximo\\s+(\\p{L}+)\\s+");
-    private static final Pattern THIS_WEEKDAY_PREFIX = Pattern.compile("(?i)^este\\s+(\\p{L}+)\\s+");
+            Pattern.compile("(?i)^(?:el\\s+)?pr[oó]ximo\\s+(\\p{L}+)(?:\\s+|$)");
+    private static final Pattern THIS_WEEKDAY_PREFIX = Pattern.compile("(?i)^este\\s+(\\p{L}+)(?:\\s+|$)");
+    private static final Pattern BARE_TIME_EXPRESSION = Pattern.compile(
+            "(?i)^(?:(?:de|por|esta)\\s+(?:la\\s+)?(?:tarde|mañana|noche)\\s+)?a las\\s+\\d{1,2}(?::\\d{2})?$");
 
     private static final Map<String, DayOfWeek> WEEKDAYS = Map.ofEntries(
             Map.entry("lunes", DayOfWeek.MONDAY),
@@ -127,7 +142,10 @@ public class BusinessDateTimeResolver {
         }
 
         try {
-            return LocalDateTime.parse(expression, ABSOLUTE_DATE_TIME_FORMATTER);
+            LocalDateTime literal = LocalDateTime.parse(expression, ABSOLUTE_DATE_TIME_FORMATTER);
+            int resolvedHour = resolveAmbiguousHour(
+                    literal.getHour(), literal.getMinute(), expression, literal.toLocalDate(), businessZone);
+            return LocalDateTime.of(literal.toLocalDate(), LocalTime.of(resolvedHour, literal.getMinute()));
         } catch (DateTimeParseException ex) {
             throw new BusinessException("No pude interpretar la fecha y hora indicadas: '" + expression + "'");
         }
@@ -138,29 +156,57 @@ public class BusinessDateTimeResolver {
 
         Matcher tomorrow = TOMORROW_PREFIX.matcher(expression);
         if (tomorrow.find()) {
-            return LocalDateTime.of(today.plusDays(1), extractTime(expression));
+            return combineDateAndTime(expression, today.plusDays(1), businessZone);
         }
 
         Matcher todayMatcher = TODAY_PREFIX.matcher(expression);
         if (todayMatcher.find()) {
-            return LocalDateTime.of(today, extractTime(expression));
+            return combineDateAndTime(expression, today, businessZone);
         }
 
         Matcher nextWeekday = NEXT_WEEKDAY_PREFIX.matcher(expression);
         if (nextWeekday.find()) {
             DayOfWeek dayOfWeek = resolveDayOfWeek(nextWeekday.group(1));
             LocalDate date = today.with(TemporalAdjusters.next(dayOfWeek));
-            return LocalDateTime.of(date, extractTime(expression));
+            return combineDateAndTime(expression, date, businessZone);
         }
 
         Matcher thisWeekday = THIS_WEEKDAY_PREFIX.matcher(expression);
         if (thisWeekday.find()) {
             DayOfWeek dayOfWeek = resolveDayOfWeek(thisWeekday.group(1));
             LocalDate date = today.with(TemporalAdjusters.nextOrSame(dayOfWeek));
-            return LocalDateTime.of(date, extractTime(expression));
+            return combineDateAndTime(expression, date, businessZone);
+        }
+
+        if (BARE_TIME_EXPRESSION.matcher(expression.trim()).matches()) {
+            // No se mencionó ninguna fecha: se asume "hoy" para poder aplicar la misma
+            // desambiguación AM/PM contra la hora actual del negocio.
+            return combineDateAndTime(expression, today, businessZone);
         }
 
         return null;
+    }
+
+    /**
+     * Resuelve solo una hora (ej. "a las 16" o "16:00") contra una fecha ya conocida de un turno
+     * anterior de la conversación (ej. el cliente ya dijo "hoy" y ahora responde solo la hora).
+     * Aplica la misma desambiguación AM/PM que el resto de la clase.
+     */
+    public Instant resolveTimeOnly(String rawExpression, LocalDate contextDate, String businessTimezone) {
+        if (rawExpression == null || rawExpression.isBlank()) {
+            throw new BusinessException("No se indicó una hora para la reserva");
+        }
+        ZoneId businessZone = validateZoneId(businessTimezone);
+        String expression = rawExpression.trim();
+
+        Matcher matcher = TIME_SUFFIX.matcher(expression);
+        if (!matcher.find()) {
+            throw new BusinessException("No pude interpretar la hora indicada: '" + expression + "'");
+        }
+        int hour = Integer.parseInt(matcher.group(1));
+        int minute = matcher.group(2) != null ? Integer.parseInt(matcher.group(2)) : 0;
+        int resolvedHour = resolveAmbiguousHour(hour, minute, expression, contextDate, businessZone);
+        return LocalDateTime.of(contextDate, LocalTime.of(resolvedHour, minute)).atZone(businessZone).toInstant();
     }
 
     private DayOfWeek resolveDayOfWeek(String dayName) {
@@ -171,14 +217,43 @@ public class BusinessDateTimeResolver {
         return dayOfWeek;
     }
 
-    private LocalTime extractTime(String expression) {
+    private LocalDateTime combineDateAndTime(String expression, LocalDate date, ZoneId businessZone) {
         Matcher matcher = TIME_SUFFIX.matcher(expression);
         if (!matcher.find()) {
-            throw new BusinessException("No pude interpretar la hora indicada: '" + expression + "'");
+            throw new MissingTimeException(date);
         }
         int hour = Integer.parseInt(matcher.group(1));
         int minute = matcher.group(2) != null ? Integer.parseInt(matcher.group(2)) : 0;
-        return LocalTime.of(hour, minute);
+        int resolvedHour = resolveAmbiguousHour(hour, minute, expression, date, businessZone);
+        return LocalDateTime.of(date, LocalTime.of(resolvedHour, minute));
+    }
+
+    /**
+     * Desambigua una hora de 12 horas (1-11) sin AM/PM explícito, en este orden:
+     * (1) marcadores textuales ("de la tarde", "por la mañana", etc.) en la expresión completa;
+     * (2) si la fecha resuelta es hoy y la lectura AM ya pasó pero la PM sigue siendo futura, se
+     *     prefiere PM; (3) si sigue sin poder resolverse, se pide aclaración al cliente. Horas
+     *     fuera del rango 1-11 (0, 12-23) no son ambiguas y se devuelven tal cual.
+     */
+    private int resolveAmbiguousHour(int hour, int minute, String expression, LocalDate date, ZoneId businessZone) {
+        if (hour < AMBIGUOUS_HOUR_MIN || hour > AMBIGUOUS_HOUR_MAX) {
+            return hour;
+        }
+        if (PM_MARKER.matcher(expression).find()) {
+            return hour + 12;
+        }
+        if (AM_MARKER.matcher(expression).find()) {
+            return hour;
+        }
+        if (date.equals(ZonedDateTime.now(businessZone).toLocalDate())) {
+            ZonedDateTime now = ZonedDateTime.now(businessZone);
+            ZonedDateTime amCandidate = ZonedDateTime.of(date, LocalTime.of(hour, minute), businessZone);
+            ZonedDateTime pmCandidate = ZonedDateTime.of(date, LocalTime.of(hour + 12, minute), businessZone);
+            if (amCandidate.isBefore(now) && !pmCandidate.isBefore(now)) {
+                return hour + 12;
+            }
+        }
+        throw new AmbiguousTimeException(hour, hour + 12, minute);
     }
 
 }

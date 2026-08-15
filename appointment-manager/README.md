@@ -203,6 +203,65 @@ Por el momento no existe una pantalla/endpoint dedicado para esto (fuera de alca
 3. Desde uno de los números de destino verificados, enviar un mensaje de texto al número de prueba.
 4. Meta entrega el evento a `POST /api/webhooks/whatsapp`; el backend lo valida, lo pasa al motor conversacional (`ConversationService`) y responde usando el mismo número de prueba mediante `MetaWhatsAppClient`.
 
+### Motor conversacional (WhatsApp + IA)
+
+El módulo `ai` (`ConversationServiceImpl`) orquesta la conversación completa. OpenAI solo interpreta
+intención, extrae entidades (`SERVICE_NAME`, `EMPLOYEE_NAME`, `START_AT`, `APPOINTMENT_ID`) y redacta
+texto libre para casos de charla general; el backend es la única fuente de verdad para identidad del
+cliente, disponibilidad y confirmación.
+
+**Identificación del cliente por `sender_phone`.** El teléfono que entrega el webhook de Meta
+(`message.getFrom()`) se trata siempre como el dato confiable del cliente — nunca se le pregunta por
+teléfono. Si no existe un `Customer` activo con ese teléfono en el `Business`, se le pide únicamente el
+nombre (`CustomerIdentityResolver`) y se crea con `phone = sender_phone`. Si el nombre llega en un solo
+token (ej. "María"), se acepta sin pedir apellido: `Customer.lastName` es una columna opcional, no hay
+ninguna regla de negocio real que lo exija.
+
+**Estado conversacional (`ConversationState`).** El proyecto no usa Redis ni ningún otro caché; la
+memoria de la conversación se persiste en una tabla JPA más (`conversation_states`, una fila por
+`business_id + customer_phone`, creada automáticamente por `ddl-auto: update` como el resto del
+esquema). Guarda qué datos de una reserva ya se recopilaron (`pendingServiceId`, `pendingEmployeeId`,
+`pendingDate`/`pendingStartAt`), si ya se saludó una vez (`greeted`) y si hay una propuesta esperando
+confirmación (`stage = AWAITING_CONFIRMATION`). Una propuesta pendiente que nadie confirma ni rechaza
+expira a los 20 minutos de inactividad (`ConversationStateStore.PENDING_CONFIRMATION_TTL`), verificado
+de forma perezosa al leer el estado — no hay ningún job/scheduler adicional.
+
+**Interpretación de fecha/hora (`BusinessDateTimeResolver`).** Toda referencia relativa ("hoy",
+"mañana", "el próximo lunes") y toda desambiguación AM/PM se resuelve usando `Business.timezone`
+(`ZoneId.of(business.getTimezone())`), nunca la zona del servidor ni UTC hardcodeado. Cuando el cliente
+da una hora ambigua de 12 horas sin aclarar ("a las 4"), se intenta resolver en este orden: (1)
+marcadores textuales ("de la tarde", "por la mañana", etc.); (2) si la fecha es hoy y la lectura AM ya
+pasó pero la PM todavía no, se prefiere PM; (3) si sigue sin poder resolverse, el backend pregunta
+explícitamente ("¿Te referís a las 04:00 o a las 16:00?") en vez de asumir. Si el cliente da la fecha y
+la hora en mensajes separados ("hoy" → luego "a las 16"), la fecha ya resuelta se recuerda en
+`ConversationState.pendingDate`/`pendingStartAt` y solo se pregunta el dato faltante.
+
+**Confirmación obligatoria antes de crear.** Ningún `Appointment` se crea en el mismo turno en que se
+completan los datos: al juntarse servicio + horario + profesional, el backend pasa la conversación a
+`AWAITING_CONFIRMATION` y pregunta explícitamente. La clasificación de la respuesta ("sí"/"no"/"otra
+hora"/etc.) es 100% determinística (`ConfirmationClassifier`, normaliza acentos/mayúsculas y compara
+contra listas fijas de palabras) — la IA nunca decide si el cliente confirmó. Solo se vuelve a llamar a
+la IA en ese estado cuando el mensaje no matchea ninguna palabra clave, para extraer un posible cambio
+de dato (ej. "mejor a las 17"), y ahí se vuelve a presentar la confirmación con el dato actualizado.
+
+**Revalidación al confirmar.** Entre la propuesta y el "sí" puede pasar tiempo real, así que la
+confirmación positiva vuelve a invocar `AppointmentService.create(...)` (las mismas validaciones reales:
+relación empleado-servicio, horario laboral, superposición, que no esté en el pasado) en vez de asumir
+que el horario propuesto sigue libre. Si ya no está disponible, se responde brevemente y se vuelve a
+`COLLECTING` sin crear nada.
+
+**Idempotencia de WhatsApp.** La deduplicación por `external_message_id` en
+`WhatsAppWebhookServiceImpl`/`whatsapp_inbound_events` ya existía y no se modificó: un evento de webhook
+duplicado nunca vuelve a llegar a `ConversationService`, así que una confirmación duplicada no puede
+producir dos citas por esa vía.
+
+**Formato de moneda y estilo.** Todos los importes que ve el cliente (listado de servicios, contexto que
+recibe la IA) se formatean con `GuaraniAmountFormatter` (`Gs. 65.000`, punto como separador de miles, sin
+decimales) — la IA nunca ve ni escribe montos en dólares. El *system prompt* (`SystemPromptBuilder`)
+separa reglas de presentación (brevedad, un saludo por conversación agregado por el backend, nunca
+mencionar UTC/IDs/JSON) de reglas de negocio (disponibilidad, confirmación), que viven exclusivamente en
+código Java y nunca dependen de que el modelo las respete.
+
 ### Advertencia
 
 No incluyas `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET` ni ningún otro secreto real en el repositorio, en el README, ni en commits. Configuralos únicamente como variables de entorno en tu entorno de ejecución.
