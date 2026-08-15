@@ -174,13 +174,25 @@ public class ConversationServiceImpl implements ConversationService {
         }
 
         // Primer contacto de un teléfono desconocido: igual se interpreta el mensaje para no
-        // perder datos que el cliente ya haya mencionado (AJUSTE 6), pero la única pregunta de
-        // este turno es el nombre.
+        // perder datos que el cliente ya haya mencionado (AJUSTE 6). No identificar a un
+        // Customer nuevo NO implica pedirle el nombre de inmediato: eso solo debe pasar cuando
+        // la intención detectada realmente requiere identificarlo (reservar/reprogramar/
+        // cancelar). Una consulta puramente informativa (servicios, precios, horarios,
+        // disponibilidad general) o un saludo se responden igual que a cualquier visitante,
+        // sin crear ni pedir datos de Customer todavía.
         ParsedAiReply parsed = askAi(business, message);
 
         if (parsed.intent() == ConversationIntent.LIST_SERVICES) {
             return finish(state, business, buildServiceListReply(business), ConversationIntent.LIST_SERVICES,
                     parsed.confidence(), null);
+        }
+
+        if (parsed.intent() == ConversationIntent.CHECK_AVAILABILITY) {
+            return handleCheckAvailability(business, state, parsed);
+        }
+
+        if (!intentRequiresCustomer(parsed.intent())) {
+            return finish(state, business, parsed.reply(), parsed.intent(), parsed.confidence(), null);
         }
 
         String mergeFailure = mergeParsedIntoDraft(state, business, parsed);
@@ -192,6 +204,18 @@ public class ConversationServiceImpl implements ConversationService {
         state.setAwaitingName(true);
         return finish(state, business, ASK_NAME_REPLY, ConversationIntent.BOOK_APPOINTMENT,
                 parsed.confidence(), null);
+    }
+
+    /**
+     * Intenciones que realmente necesitan identificar (o crear) al Customer. No confundir
+     * "sender_phone desconocido" con "hay que registrar al Customer ya mismo": eso solo aplica
+     * cuando la operación de negocio lo requiere (reservar, reprogramar, cancelar). Reutiliza el
+     * enum de intents existente; no agrega un sistema paralelo de intenciones.
+     */
+    private boolean intentRequiresCustomer(ConversationIntent intent) {
+        return intent == ConversationIntent.BOOK_APPOINTMENT
+                || intent == ConversationIntent.RESCHEDULE_APPOINTMENT
+                || intent == ConversationIntent.CANCEL_APPOINTMENT;
     }
 
     // ---------------------------------------------------------------------------------------

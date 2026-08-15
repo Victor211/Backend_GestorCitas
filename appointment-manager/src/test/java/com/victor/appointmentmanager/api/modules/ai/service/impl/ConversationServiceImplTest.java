@@ -311,6 +311,102 @@ class ConversationServiceImplTest {
     }
 
     // ---------------------------------------------------------------------------------------
+    // Corrección: "sender_phone desconocido" no implica "identificar al Customer ya mismo".
+    // Solo las intenciones que realmente lo requieren (reservar/reprogramar/cancelar) piden
+    // nombre; una consulta informativa o un saludo se responden sin crear ni pedir Customer.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void unknownNumberGreetingDoesNotAskForNameNorCreatesCustomer() {
+        String phone = "+595987111001";
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\n"
+                + "REPLY: ¿Te ayudo a reservar un turno o necesitas información sobre nuestros servicios?");
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Hola");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(result.getReply()).contains("Peluquería Elegance");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+    }
+
+    @Test
+    void unknownNumberServiceQueryRespondsWithoutAskingIdentityOrCreatingCustomer() {
+        String phone = "+595987111002";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(corte)));
+        stubAi("¿Qué servicios ofrecen?", "INTENT: LIST_SERVICES\nCONFIDENCE: 0.9\nREPLY: no importa");
+
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "¿Qué servicios ofrecen?");
+
+        assertThat(result.getReply()).contains("Corte");
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+    }
+
+    @Test
+    void unknownNumberGeneralAvailabilityQueryDoesNotAskForIdentityOrCreateCustomer() {
+        String phone = "+595987111005";
+        stubAi("¿Tienen lugar mañana?",
+                "INTENT: CHECK_AVAILABILITY\nCONFIDENCE: 0.7\nREPLY: Sí, tenemos varios horarios disponibles.");
+
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "¿Tienen lugar mañana?");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+    }
+
+    @Test
+    void unknownNumberBookingIntentAsksForNameAndCreatesCustomerOnlyAfterNameProvided() {
+        String phone = "+595987111003";
+        stubAi("Quiero reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+
+        ConversationResponse first = conversationService.processChannelConversation(
+                1L, phone, "Quiero reservar un turno");
+
+        assertThat(first.getReply()).contains("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+
+        conversationService.processChannelConversation(1L, phone, "María López");
+
+        assertThat(customersByPhone).containsKey(phone);
+        assertThat(customersByPhone.get(phone).getPhone()).isEqualTo(phone);
+    }
+
+    @Test
+    void firstMessageGreetingPlusServiceQueryAnswersImmediatelyWithoutAskingName() {
+        String phone = "+595987111004";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(corte)));
+        stubAi("Hola, ¿qué servicios ofrecen?", "INTENT: LIST_SERVICES\nCONFIDENCE: 0.9\nREPLY: no importa");
+
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Hola, ¿qué servicios ofrecen?");
+
+        assertThat(result.getReply()).contains("Peluquería Elegance");
+        assertThat(result.getReply()).contains("Corte");
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+    }
+
+    @Test
+    void existingCustomerGreetingDoesNotAskForNameOrStartBookingAutomatically() {
+        String phone = "+595981222444";
+        existingCustomer(phone, "Cristian");
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\n"
+                + "REPLY: ¿Te ayudo a reservar un turno o necesitas información?");
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Hola");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+    }
+
+    // ---------------------------------------------------------------------------------------
     // AJUSTE 6: saludo inicial
     // ---------------------------------------------------------------------------------------
 

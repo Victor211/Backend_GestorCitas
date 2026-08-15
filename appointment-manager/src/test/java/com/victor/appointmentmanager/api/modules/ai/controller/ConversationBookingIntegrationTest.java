@@ -367,6 +367,52 @@ class ConversationBookingIntegrationTest {
     }
 
     // ---------------------------------------------------------------------------------------
+    // Corrección: "sender_phone desconocido" no implica identificar al Customer ya mismo. Un
+    // saludo o una consulta informativa NO deben crear Customer ni pedir nombre; solo la
+    // intención de reservar lo requiere.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void unknownPhoneGreetingAndInfoQueriesNeverCreateACustomerOnlyBookingIntentDoes() throws Exception {
+        String unknownPhone = customerPhone + "-desconocido";
+
+        long customersBefore = customersCount();
+
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("Hola"))).thenReturn(
+                "INTENT: GREETING\nCONFIDENCE: 0.9\n"
+                        + "REPLY: ¿Te ayudo a reservar un turno o necesitas información sobre nuestros servicios?");
+        String greetingResponse = converse(unknownPhone, "Hola");
+        JsonNode greeting = objectMapper.readTree(greetingResponse).path("data");
+        assertThat(greeting.path("reply").asText()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersCount()).isEqualTo(customersBefore);
+
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("¿Qué servicios ofrecen?")))
+                .thenReturn("INTENT: LIST_SERVICES\nCONFIDENCE: 0.9\nREPLY: no importa");
+        String servicesResponse = converse(unknownPhone, "¿Qué servicios ofrecen?");
+        JsonNode services = objectMapper.readTree(servicesResponse).path("data");
+        assertThat(services.path("reply").asText()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersCount()).isEqualTo(customersBefore);
+
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("Quiero reservar un turno")))
+                .thenReturn("INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        String bookingResponse = converse(unknownPhone, "Quiero reservar un turno");
+        JsonNode booking = objectMapper.readTree(bookingResponse).path("data");
+        assertThat(booking.path("reply").asText()).contains("¿Cuál es tu nombre?");
+        assertThat(customersCount()).isEqualTo(customersBefore);
+
+        converse(unknownPhone, "María López");
+        assertThat(customersCount()).isEqualTo(customersBefore + 1);
+    }
+
+    private long customersCount() throws Exception {
+        String response = mockMvc.perform(get("/api/customers?page=0&size=1")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        return objectMapper.readTree(response).path("data").path("totalElements").asLong();
+    }
+
+    // ---------------------------------------------------------------------------------------
     // CASO B: cliente existente, mensaje único ya completo -> solo pregunta confirmación
     // ---------------------------------------------------------------------------------------
 
