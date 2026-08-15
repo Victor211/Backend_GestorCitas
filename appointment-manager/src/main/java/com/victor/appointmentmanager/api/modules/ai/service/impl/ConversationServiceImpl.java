@@ -52,6 +52,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -66,7 +67,6 @@ public class ConversationServiceImpl implements ConversationService {
             "Disculpá, no pude procesar tu mensaje en este momento. ¿Podés reformularlo?";
 
     private static final String ASK_NAME_REPLY = "¿Cuál es tu nombre?";
-    private static final String ASK_SERVICE_REPLY = "¿Qué servicio te gustaría reservar?";
     private static final String ASK_DATE_REPLY = "¿Para cuándo te gustaría el turno?";
     private static final String ASK_TIME_REPLY = "¿A qué hora te gustaría?";
     private static final String SERVICE_NOT_FOUND_REPLY =
@@ -88,6 +88,8 @@ public class ConversationServiceImpl implements ConversationService {
             "Se me perdieron los datos de la reserva. ¿Podés indicarme de nuevo el servicio y el horario?";
     private static final String PROPOSAL_EXPIRED_REPLY =
             "Esa propuesta ya venció. ¿Querés que revisemos de nuevo el horario?";
+    private static final String NO_AVAILABILITY_AT_TIME_REPLY =
+            "No hay disponibilidad para ese horario. ¿Quieres probar otra hora?";
 
     private static final double CONFIRMED_BOOKING_CONFIDENCE = 1.0;
     private static final double DETERMINISTIC_CONFIDENCE = 1.0;
@@ -152,10 +154,44 @@ public class ConversationServiceImpl implements ConversationService {
         Business business = findActiveBusinessOrThrow(businessId);
         ConversationState state = conversationStateStore.loadOrCreate(businessId, customerPhone);
 
-        ConversationResponse response = route(business, customerPhone, message, state);
+        ConversationResponse response = isResetCommand(message)
+                ? handleResetCommand(business, customerPhone, state)
+                : route(business, customerPhone, message, state);
 
         conversationStateStore.save(state);
         return response;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Comandos internos de QA (/reset, /terminate): se procesan antes que cualquier otra cosa
+    // — nunca llegan a OpenAI ni a la clasificación de intención/extracción de entidades — para
+    // poder limpiar manualmente el ConversationState de un business+senderPhone entre escenarios
+    // de prueba, sin tocar Customer/Appointments/whatsapp_inbound_events ni el timeout automático.
+    // ---------------------------------------------------------------------------------------
+
+    private static final Set<String> RESET_COMMANDS = Set.of("/reset", "/terminate");
+    private static final String CONVERSATION_RESET_REPLY = "Conversación reiniciada.";
+
+    private boolean isResetCommand(String message) {
+        return message != null && RESET_COMMANDS.contains(message.trim().toLowerCase(Locale.ROOT));
+    }
+
+    private ConversationResponse handleResetCommand(Business business, String customerPhone, ConversationState state) {
+        log.info("Conversation reset requested. businessId={}, senderPhone={}",
+                business.getId(), maskPhone(customerPhone));
+        state.resetForNewConversation();
+        return new ConversationResponse(CONVERSATION_RESET_REPLY, ConversationIntent.UNKNOWN,
+                DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    private static final int VISIBLE_PHONE_SUFFIX_LENGTH = 3;
+
+    private static String maskPhone(String phone) {
+        if (phone == null || phone.length() <= VISIBLE_PHONE_SUFFIX_LENGTH) {
+            return "***";
+        }
+        String suffix = phone.substring(phone.length() - VISIBLE_PHONE_SUFFIX_LENGTH);
+        return "*".repeat(phone.length() - VISIBLE_PHONE_SUFFIX_LENGTH) + suffix;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -305,9 +341,12 @@ public class ConversationServiceImpl implements ConversationService {
                     parsed.confidence(), null);
         }
 
-        if (!hasBookingDraftProgress(state)) {
-            // Charla libre (saludo, pregunta general) sin ningún dato de reserva: se usa el texto
-            // de la IA tal cual, ya que no hay ninguna acción de negocio que verificar.
+        if (parsed.intent() != ConversationIntent.BOOK_APPOINTMENT && !hasBookingDraftProgress(state)) {
+            // Charla libre (saludo, pregunta general) sin ningún dato de reserva ni intención
+            // explícita de reservar: se usa el texto de la IA tal cual, no hay nada que resolver
+            // en el flujo de reserva todavía. Un BOOK_APPOINTMENT explícito SIEMPRE entra al
+            // flujo (aunque no haya extraído ningún dato) para mostrar el catálogo de una vez
+            // (AJUSTE 1) en vez de responder con una pregunta genérica de la IA.
             return finish(state, business, parsed.reply(), parsed.intent(), parsed.confidence(), null);
         }
 
@@ -453,22 +492,19 @@ public class ConversationServiceImpl implements ConversationService {
 
     private DispatchOutcome advanceBookingFlow(Business business, ConversationState state) {
         state.setStage(ConversationStage.COLLECTING);
-        autoResolveEmployeeIfUnambiguous(business.getId(), state);
 
         if (!state.hasPendingService()) {
-            return DispatchOutcome.reply(ASK_SERVICE_REPLY);
+            // AJUSTE 1: mostrar el catálogo real (con precio) en vez de una pregunta genérica.
+            return DispatchOutcome.reply(buildServiceListReply(business));
         }
         if (state.getPendingStartAt() == null) {
+            // AJUSTE 3: sin fecha/hora todavía no tiene sentido preguntar profesional.
             return DispatchOutcome.reply(state.getPendingDate() != null ? ASK_TIME_REPLY : ASK_DATE_REPLY);
         }
-        if (!state.hasPendingEmployee()) {
-            List<Employee> candidates = employeesForService(business.getId(), state.getPendingServiceId());
-            if (candidates.isEmpty()) {
-                state.clearBookingDraft();
-                return DispatchOutcome.reply(EMPLOYEE_NOT_AVAILABLE_REPLY);
-            }
-            String names = candidates.stream().map(this::employeeDisplayName).collect(Collectors.joining(", "));
-            return DispatchOutcome.reply("¿Con qué profesional prefieres reservar? Puede ser " + names + ".");
+
+        DispatchOutcome employeeIssue = resolveEmployeeForProposal(business, state);
+        if (employeeIssue != null) {
+            return employeeIssue;
         }
 
         Optional<Service> service = serviceRepository.findByIdAndBusinessIdAndActiveTrue(
@@ -490,16 +526,77 @@ public class ConversationServiceImpl implements ConversationService {
                 state.getPendingStartAt()));
     }
 
-    private void autoResolveEmployeeIfUnambiguous(Long businessId, ConversationState state) {
-        if (!state.hasPendingService() || state.hasPendingEmployee()) {
-            return;
+    /**
+     * Resuelve el profesional contra disponibilidad real (Employee-Service, horario laboral, sin
+     * superposición) para el servicio y horario ya conocidos — nunca solo por capacidad de
+     * realizar el servicio (AJUSTE 6/7). Prioridad: un profesional ya elegido (explícito, por
+     * pronombre, o de un turno anterior) NUNCA se reemplaza en silencio; si ya no está libre a la
+     * hora resuelta, se avisa y se vuelve a pedir horario en lugar de autoasignar otro (esto es lo
+     * que causaba que "Juan" terminara reemplazado por "Victor" sin que el cliente lo pidiera).
+     * Devuelve {@code null} cuando el empleado queda resuelto y se puede continuar.
+     */
+    private DispatchOutcome resolveEmployeeForProposal(Business business, ConversationState state) {
+        if (state.hasPendingEmployee()) {
+            Optional<Employee> chosen = employeeRepository.findByIdAndBusinessIdAndActiveTrue(
+                    state.getPendingEmployeeId(), business.getId());
+            if (chosen.isPresent()) {
+                String serviceName = serviceRepository.findByIdAndBusinessIdAndActiveTrue(
+                                state.getPendingServiceId(), business.getId())
+                        .map(Service::getName).orElse(null);
+                if (isEmployeeAvailable(business, chosen.get(), state.getPendingStartAt(), serviceName)) {
+                    return null;
+                }
+                state.setPendingStartAt(null);
+                state.setPendingDate(null);
+                return DispatchOutcome.reply(employeeDisplayName(chosen.get())
+                        + " no está disponible a esa hora. ¿Quieres probar otro horario?");
+            }
+            // El empleado guardado ya no existe/está activo: se resuelve de nuevo abajo.
+            state.setPendingEmployeeId(null);
         }
-        List<Employee> candidates = employeesForService(businessId, state.getPendingServiceId());
-        if (candidates.size() == 1) {
-            Employee onlyCandidate = candidates.get(0);
-            state.setPendingEmployeeId(onlyCandidate.getId());
-            rememberEmployee(state, onlyCandidate);
+
+        List<Employee> available = resolveAvailableEmployees(business, state.getPendingServiceId(),
+                state.getPendingStartAt());
+        if (available.isEmpty()) {
+            state.setPendingStartAt(null);
+            state.setPendingDate(null);
+            return DispatchOutcome.reply(NO_AVAILABILITY_AT_TIME_REPLY);
         }
+        if (available.size() > 1) {
+            return DispatchOutcome.reply(buildMultipleEmployeesReply(business, available, state.getPendingStartAt()));
+        }
+
+        Employee onlyCandidate = available.get(0);
+        state.setPendingEmployeeId(onlyCandidate.getId());
+        rememberEmployee(state, onlyCandidate);
+        return null;
+    }
+
+    /** Empleados activos, habilitados para el servicio, y realmente libres en ese horario. */
+    private List<Employee> resolveAvailableEmployees(Business business, Long serviceId, Instant startAt) {
+        List<Employee> candidates = employeesForService(business.getId(), serviceId);
+        if (candidates.isEmpty()) {
+            return candidates;
+        }
+        String serviceName = serviceRepository.findByIdAndBusinessIdAndActiveTrue(serviceId, business.getId())
+                .map(Service::getName).orElse(null);
+        return candidates.stream()
+                .filter(employee -> isEmployeeAvailable(business, employee, startAt, serviceName))
+                .toList();
+    }
+
+    private String buildMultipleEmployeesReply(Business business, List<Employee> candidates, Instant startAt) {
+        ZonedDateTime local = startAt.atZone(ZoneId.of(business.getTimezone()));
+        String names = joinWithAnd(candidates.stream().map(this::employeeDisplayName).toList());
+        return "Para " + describeDate(local) + " a las " + LOCAL_TIME_FORMATTER.format(local)
+                + " están disponibles " + names + ". ¿Con cuál prefieres reservar?";
+    }
+
+    private String joinWithAnd(List<String> items) {
+        if (items.size() <= 1) {
+            return items.isEmpty() ? "" : items.get(0);
+        }
+        return String.join(", ", items.subList(0, items.size() - 1)) + " y " + items.get(items.size() - 1);
     }
 
     /**
@@ -524,6 +621,13 @@ public class ConversationServiceImpl implements ConversationService {
                 .toList();
     }
 
+    private boolean employeeCanPerformService(Long businessId, Long employeeId, Long serviceId) {
+        return employeeRepository.findByIdAndBusinessIdAndActiveTrue(employeeId, businessId)
+                .map(employee -> employee.getServices().stream()
+                        .anyMatch(assigned -> assigned.getId().equals(serviceId)))
+                .orElse(false);
+    }
+
     /**
      * Aplica sobre el borrador persistido (ConversationState) los datos que la IA extrajo de
      * este turno, sin pisar nunca un dato ya confirmado por uno ausente (NONE). Devuelve un
@@ -537,8 +641,18 @@ public class ConversationServiceImpl implements ConversationService {
             if (service.isEmpty()) {
                 return SERVICE_NOT_FOUND_REPLY;
             }
-            state.setPendingServiceId(service.get().getId());
-            state.setPendingEmployeeId(null);
+            Long newServiceId = service.get().getId();
+            boolean serviceActuallyChanged = !newServiceId.equals(state.getPendingServiceId());
+            state.setPendingServiceId(newServiceId);
+            // Un profesional ya elegido (explícito, por pronombre, o de un turno anterior) NUNCA
+            // se pisa solo porque el mensaje repite/reafirma el servicio: eso era el bug real
+            // ("Juan" terminaba reemplazado por "Victor" sin que el cliente lo pidiera). Solo se
+            // limpia si el servicio realmente cambió Y el profesional ya elegido no puede
+            // realizar el nuevo servicio.
+            if (serviceActuallyChanged && state.hasPendingEmployee()
+                    && !employeeCanPerformService(business.getId(), state.getPendingEmployeeId(), newServiceId)) {
+                state.setPendingEmployeeId(null);
+            }
         }
 
         if (parsed.employeeName() != null) {
@@ -643,7 +757,15 @@ public class ConversationServiceImpl implements ConversationService {
             return finish(state, business, mergeFailure, ConversationIntent.CHECK_AVAILABILITY,
                     parsed.confidence(), null);
         }
-        autoResolveEmployeeIfUnambiguous(business.getId(), state);
+
+        if (state.getPendingStartAt() != null && !state.hasPendingEmployee() && state.hasPendingService()) {
+            List<Employee> available = resolveAvailableEmployees(business, state.getPendingServiceId(),
+                    state.getPendingStartAt());
+            if (available.size() == 1) {
+                state.setPendingEmployeeId(available.get(0).getId());
+                rememberEmployee(state, available.get(0));
+            }
+        }
 
         Optional<Employee> employee = state.hasPendingEmployee()
                 ? employeeRepository.findByIdAndBusinessIdAndActiveTrue(state.getPendingEmployeeId(), business.getId())
@@ -663,9 +785,10 @@ public class ConversationServiceImpl implements ConversationService {
         boolean available = isEmployeeAvailable(business, employee.get(), state.getPendingStartAt(), serviceName);
         ZonedDateTime localStart = state.getPendingStartAt().atZone(ZoneId.of(business.getTimezone()));
         String time = LOCAL_TIME_FORMATTER.format(localStart);
+        String serviceSuffix = serviceName != null ? " para " + serviceName : "";
         String reply = available
                 ? "Sí, " + employee.get().getFirstName() + " está disponible " + describeDate(localStart)
-                        + " a las " + time + ". ¿Quieres reservar?"
+                        + " a las " + time + serviceSuffix + ". ¿Quieres reservar?"
                 : employee.get().getFirstName() + " no está disponible a las " + time
                         + ". ¿Quieres que te muestre otro horario?";
 
@@ -782,7 +905,7 @@ public class ConversationServiceImpl implements ConversationService {
         ZonedDateTime localStart = startAt.atZone(ZoneId.of(business.getTimezone()));
         return "Entonces reservaríamos un " + service.getName() + " con " + employeeDisplayName(employee)
                 + " para " + describeDate(localStart) + " a las " + LOCAL_TIME_FORMATTER.format(localStart)
-                + ". ¿Confirmás?";
+                + " por " + guaraniAmountFormatter.format(service.getPrice()) + ". ¿Confirmás?";
     }
 
     private String describeDate(ZonedDateTime localStart) {

@@ -232,6 +232,40 @@ class ConversationBookingIntegrationTest {
     }
 
     @Test
+    void resetCommandNeverInvokesOpenAiAndDoesNotAffectPersistedCustomerOrAppointments() throws Exception {
+        long appointmentId = proposeAndConfirm(customerPhone, "Quiero reservar un corte el lunes a las 9", slotStart);
+        assertThat(appointmentId).isPositive();
+
+        String resetResponse = converse("/reset");
+        JsonNode resetData = objectMapper.readTree(resetResponse).path("data");
+        assertThat(resetData.path("reply").asText()).isEqualTo("Conversación reiniciada.");
+        org.mockito.Mockito.verify(aiProvider, org.mockito.Mockito.never())
+                .generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("/reset"));
+
+        // La cita creada antes del reset sigue existiendo (/reset solo limpia el borrador
+        // conversacional, nunca Appointments).
+        mockMvc.perform(get("/api/appointments?page=0&size=10")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalElements").value(1))
+                .andExpect(jsonPath("$.data.content[0].id").value(appointmentId));
+
+        // El Customer identificado por sender_phone sigue existiendo (/reset no lo toca).
+        mockMvc.perform(get("/api/customers/by-phone").param("phone", customerPhone)
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phone").value(customerPhone));
+
+        // Un "Hola" después del reset arranca una conversación limpia, no continúa la reserva
+        // ya confirmada.
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("Hola")))
+                .thenReturn("INTENT: GREETING\nCONFIDENCE: 0.9\nREPLY: ¿En qué puedo ayudarte?");
+        String greetingResponse = converse("Hola");
+        JsonNode greetingData = objectMapper.readTree(greetingResponse).path("data");
+        assertThat(greetingData.path("reply").asText()).doesNotContain("¿Confirmás?");
+    }
+
+    @Test
     void cancelledAppointmentDoesNotBlockNewBookingAndCreatesNewAppointment() throws Exception {
         long firstAppointmentId = proposeAndConfirm(
                 customerPhone, "Quiero reservar un corte el lunes a las 9", slotStart);
@@ -264,22 +298,21 @@ class ConversationBookingIntegrationTest {
     }
 
     @Test
-    void slotTakenBetweenProposalAndConfirmationIsRevalidatedAndDoesNotDoubleBook() throws Exception {
+    void slotTakenBeforeProposalIsDetectedImmediatelyInsteadOfOnlyAtConfirmation() throws Exception {
         long firstAppointmentId = proposeAndConfirm(
                 customerPhone, "Quiero reservar un corte el lunes a las 9", slotStart);
         assertThat(firstAppointmentId).isPositive();
 
-        // Un segundo cliente propone el mismo horario (todavía no confirma).
+        // AJUSTE 6/9: un segundo cliente que propone el mismo horario ya ocupado ahora lo detecta
+        // en el mismo turno de la propuesta (disponibilidad real, no solo capacidad del servicio),
+        // en vez de recién enterarse al confirmar.
         String otherPhone = customerPhone + "9";
         createCustomer(otherPhone);
         stubAiBookingReply("Quiero reservar otro corte el lunes a las 9", slotStart);
         String secondProposalResponse = converse(otherPhone, "Quiero reservar otro corte el lunes a las 9");
         JsonNode secondProposal = objectMapper.readTree(secondProposalResponse).path("data");
-        assertThat(secondProposal.path("reply").asText()).contains("¿Confirmás?");
-
-        // Al confirmar, la revalidación detecta que el horario ya no está libre.
-        JsonNode secondConfirmed = confirm(otherPhone);
-        assertThat(secondConfirmed.path("appointmentId").isNull()).isTrue();
+        assertThat(secondProposal.path("reply").asText()).contains("disponibilidad");
+        assertThat(secondProposal.path("appointmentId").isNull()).isTrue();
 
         mockMvc.perform(get("/api/appointments?page=0&size=10")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
