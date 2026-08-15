@@ -86,6 +86,8 @@ public class ConversationServiceImpl implements ConversationService {
     private static final String NO_SERVICES_REPLY = "Por el momento no tenemos servicios cargados.";
     private static final String STALE_DRAFT_REPLY =
             "Se me perdieron los datos de la reserva. ¿Podés indicarme de nuevo el servicio y el horario?";
+    private static final String PROPOSAL_EXPIRED_REPLY =
+            "Esa propuesta ya venció. ¿Querés que revisemos de nuevo el horario?";
 
     private static final double CONFIRMED_BOOKING_CONFIDENCE = 1.0;
     private static final double DETERMINISTIC_CONFIDENCE = 1.0;
@@ -102,6 +104,24 @@ public class ConversationServiceImpl implements ConversationService {
      */
     private static final Pattern TIME_ONLY_EXPRESSION = Pattern.compile(
             "(?i)^(?:(?:de|por|esta)\\s+(?:la\\s+)?(?:tarde|mañana|noche)\\s+)?a las\\s+\\d{1,2}(?::\\d{2})?$");
+
+    /**
+     * Referencias pronominales al último profesional mencionado en la conversación ("con él",
+     * "con ella", "el mismo", "ese profesional"), usadas cuando la IA no extrajo un EMPLOYEE_NAME
+     * explícito en este turno. No sustituye NLP: es una resolución mínima y determinística contra
+     * {@link ConversationState#getLastReferencedEmployeeId()}.
+     */
+    private static final Pattern EMPLOYEE_PRONOUN_REFERENCE = Pattern.compile(
+            "(?i)\\bcon\\s+(?:el|él|ella|el\\s+mismo|la\\s+misma)\\b|\\b(?:ese|esa)\\s+(?:profesional|empleado|empleada)\\b");
+
+    /**
+     * Pedido explícito de reiniciar el flujo de reserva ("empezar de nuevo", "otra reserva",
+     * etc.), reconocido fuera de AWAITING_CONFIRMATION (ahí ya lo cubre {@link ConfirmationClassifier}).
+     * Solo limpia el borrador de reserva; nunca la identidad del Customer.
+     */
+    private static final Pattern EXPLICIT_RESTART_REQUEST = Pattern.compile(
+            "(?i)\\bempezar\\s+de\\s+nuevo\\b|\\b(?:nueva|otra)\\s+reserva\\b|\\breiniciar\\b|"
+                    + "\\bcomenzar\\s+otra\\s+vez\\b");
 
     private final AiProvider aiProvider;
     private final SystemPromptBuilder systemPromptBuilder;
@@ -147,6 +167,18 @@ public class ConversationServiceImpl implements ConversationService {
         Optional<Customer> existingCustomer = customerIdentityResolver.findActive(business.getId(), customerPhone);
         existingCustomer.ifPresent(customer -> state.setCustomerId(customer.getId()));
 
+        if (state.isExpiredPendingConfirmation()) {
+            state.setExpiredPendingConfirmation(false);
+            if (confirmationClassifier.classify(message) == ConfirmationSignal.POSITIVE) {
+                // Un "sí" desfasado no debe crear una cita a ciegas: el borrador ya se limpió al
+                // cargar el estado (expiró), así que no hay nada seguro que confirmar.
+                return finish(state, business, PROPOSAL_EXPIRED_REPLY, ConversationIntent.REJECT_APPOINTMENT,
+                        DETERMINISTIC_CONFIDENCE, null);
+            }
+            // Cualquier otro mensaje (uno nuevo con intención propia, un saludo, etc.) sigue el
+            // flujo normal ya con el borrador limpio, sin arrastrar la propuesta vencida.
+        }
+
         if (state.getStage() == ConversationStage.AWAITING_CONFIRMATION) {
             return respondToConfirmationStage(business, message, state, existingCustomer);
         }
@@ -173,6 +205,15 @@ public class ConversationServiceImpl implements ConversationService {
                     DETERMINISTIC_CONFIDENCE);
         }
 
+        if (isExplicitCancellation(state, message)) {
+            state.clearBookingDraft();
+            return finish(state, business, BOOKING_CANCELLED_REPLY, ConversationIntent.REJECT_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        if (EXPLICIT_RESTART_REQUEST.matcher(message).find()) {
+            state.clearBookingDraft();
+        }
+
         // Primer contacto de un teléfono desconocido: igual se interpreta el mensaje para no
         // perder datos que el cliente ya haya mencionado (AJUSTE 6). No identificar a un
         // Customer nuevo NO implica pedirle el nombre de inmediato: eso solo debe pasar cuando
@@ -180,7 +221,7 @@ public class ConversationServiceImpl implements ConversationService {
         // cancelar). Una consulta puramente informativa (servicios, precios, horarios,
         // disponibilidad general) o un saludo se responden igual que a cualquier visitante,
         // sin crear ni pedir datos de Customer todavía.
-        ParsedAiReply parsed = askAi(business, message);
+        ParsedAiReply parsed = askAi(business, state, message);
 
         if (parsed.intent() == ConversationIntent.LIST_SERVICES) {
             return finish(state, business, buildServiceListReply(business), ConversationIntent.LIST_SERVICES,
@@ -188,14 +229,14 @@ public class ConversationServiceImpl implements ConversationService {
         }
 
         if (parsed.intent() == ConversationIntent.CHECK_AVAILABILITY) {
-            return handleCheckAvailability(business, state, parsed);
+            return handleCheckAvailability(business, state, parsed, message);
         }
 
         if (!intentRequiresCustomer(parsed.intent())) {
             return finish(state, business, parsed.reply(), parsed.intent(), parsed.confidence(), null);
         }
 
-        String mergeFailure = mergeParsedIntoDraft(state, business, parsed);
+        String mergeFailure = mergeParsedIntoDraft(state, business, parsed, message);
         if (mergeFailure != null) {
             return finish(state, business, mergeFailure, ConversationIntent.BOOK_APPOINTMENT,
                     parsed.confidence(), null);
@@ -224,7 +265,16 @@ public class ConversationServiceImpl implements ConversationService {
 
     private ConversationResponse respondToKnownCustomer(Business business, Customer customer, String message,
                                                           ConversationState state) {
-        ParsedAiReply parsed = askAi(business, message);
+        if (isExplicitCancellation(state, message)) {
+            state.clearBookingDraft();
+            return finish(state, business, BOOKING_CANCELLED_REPLY, ConversationIntent.REJECT_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        if (EXPLICIT_RESTART_REQUEST.matcher(message).find()) {
+            state.clearBookingDraft();
+        }
+
+        ParsedAiReply parsed = askAi(business, state, message);
 
         switch (parsed.intent()) {
             case LIST_SERVICES -> {
@@ -232,7 +282,7 @@ public class ConversationServiceImpl implements ConversationService {
                         parsed.confidence(), null);
             }
             case CHECK_AVAILABILITY -> {
-                return handleCheckAvailability(business, state, parsed);
+                return handleCheckAvailability(business, state, parsed, message);
             }
             case RESCHEDULE_APPOINTMENT -> {
                 Long appointmentId = handleReschedule(customer, business, parsed);
@@ -249,7 +299,7 @@ public class ConversationServiceImpl implements ConversationService {
             }
         }
 
-        String mergeFailure = mergeParsedIntoDraft(state, business, parsed);
+        String mergeFailure = mergeParsedIntoDraft(state, business, parsed, message);
         if (mergeFailure != null) {
             return finish(state, business, mergeFailure, ConversationIntent.BOOK_APPOINTMENT,
                     parsed.confidence(), null);
@@ -268,6 +318,17 @@ public class ConversationServiceImpl implements ConversationService {
     private boolean hasBookingDraftProgress(ConversationState state) {
         return state.hasPendingService() || state.hasPendingEmployee()
                 || state.getPendingStartAt() != null || state.getPendingDate() != null;
+    }
+
+    /**
+     * Cancelación explícita ("cancelar", "ya no quiero", "olvídalo") mientras se está
+     * recopilando una reserva (fuera de AWAITING_CONFIRMATION, que ya la maneja
+     * {@code respondToConfirmationStage}). Se decide en backend con el mismo clasificador
+     * determinístico que la confirmación, nunca dejando que la IA decida si el cliente canceló.
+     */
+    private boolean isExplicitCancellation(ConversationState state, String message) {
+        return hasBookingDraftProgress(state) && !state.isAwaitingName()
+                && confirmationClassifier.classify(message) == ConfirmationSignal.NEGATIVE_FULL;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -370,7 +431,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     private DispatchOutcome handleModificationDuringConfirmation(Business business, ConversationState state,
                                                                    String message) {
-        ParsedAiReply parsed = askAi(business, message);
+        ParsedAiReply parsed = askAi(business, state, message);
 
         boolean mentionedChange = parsed.serviceName() != null || parsed.employeeName() != null
                 || parsed.startAtText() != null;
@@ -378,7 +439,7 @@ public class ConversationServiceImpl implements ConversationService {
             return DispatchOutcome.reply(parsed.reply());
         }
 
-        String mergeFailure = mergeParsedIntoDraft(state, business, parsed);
+        String mergeFailure = mergeParsedIntoDraft(state, business, parsed, message);
         if (mergeFailure != null) {
             return DispatchOutcome.reply(mergeFailure);
         }
@@ -419,6 +480,11 @@ public class ConversationServiceImpl implements ConversationService {
             return DispatchOutcome.reply(BOOKING_FAILED_REPLY);
         }
 
+        log.debug("Propuesta de reserva presentada. businessId={}, customerId={}, serviceId={}, employeeId={}, "
+                        + "startAt={}",
+                business.getId(), state.getCustomerId(), state.getPendingServiceId(), state.getPendingEmployeeId(),
+                state.getPendingStartAt());
+
         state.setStage(ConversationStage.AWAITING_CONFIRMATION);
         return DispatchOutcome.reply(buildConfirmationQuestion(business, service.get(), employee.get(),
                 state.getPendingStartAt()));
@@ -430,8 +496,23 @@ public class ConversationServiceImpl implements ConversationService {
         }
         List<Employee> candidates = employeesForService(businessId, state.getPendingServiceId());
         if (candidates.size() == 1) {
-            state.setPendingEmployeeId(candidates.get(0).getId());
+            Employee onlyCandidate = candidates.get(0);
+            state.setPendingEmployeeId(onlyCandidate.getId());
+            rememberEmployee(state, onlyCandidate);
         }
+    }
+
+    /**
+     * Recuerda el último Employee mencionado o resuelto en la conversación, para poder resolver
+     * referencias pronominales ("con él", "el mismo") sin volver a preguntar el profesional.
+     */
+    private void rememberEmployee(ConversationState state, Employee employee) {
+        state.setLastReferencedEmployeeId(employee.getId());
+        state.setLastReferencedEmployeeName(employeeDisplayName(employee));
+    }
+
+    private boolean referencesLastEmployee(String rawMessage) {
+        return rawMessage != null && EMPLOYEE_PRONOUN_REFERENCE.matcher(rawMessage).find();
     }
 
     private List<Employee> employeesForService(Long businessId, Long serviceId) {
@@ -449,7 +530,8 @@ public class ConversationServiceImpl implements ConversationService {
      * mensaje de error si algo mencionado explícitamente no pudo resolverse contra el negocio
      * real (servicio inexistente, empleado inexistente, fecha/hora inválida).
      */
-    private String mergeParsedIntoDraft(ConversationState state, Business business, ParsedAiReply parsed) {
+    private String mergeParsedIntoDraft(ConversationState state, Business business, ParsedAiReply parsed,
+                                         String rawMessage) {
         if (parsed.serviceName() != null) {
             Optional<Service> service = findServiceByName(business.getId(), parsed.serviceName());
             if (service.isEmpty()) {
@@ -465,6 +547,12 @@ public class ConversationServiceImpl implements ConversationService {
                 return EMPLOYEE_NOT_AVAILABLE_REPLY;
             }
             state.setPendingEmployeeId(employee.get().getId());
+            rememberEmployee(state, employee.get());
+        } else if (!state.hasPendingEmployee() && state.getLastReferencedEmployeeId() != null
+                && referencesLastEmployee(rawMessage)) {
+            // "con él"/"el mismo"/etc.: el usuario se refiere al último profesional mencionado,
+            // no a uno nuevo. No hace falta volver a preguntar el nombre.
+            state.setPendingEmployeeId(state.getLastReferencedEmployeeId());
         }
 
         if (parsed.startAtText() != null) {
@@ -542,27 +630,38 @@ public class ConversationServiceImpl implements ConversationService {
     // Disponibilidad puntual (distinto de reservar): respuesta breve, sin crear ningún draft
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * Consulta disponibilidad usando el borrador consolidado, no solo lo que la IA extrajo de
+     * este mensaje puntual: "¿Está disponible?" (sin repetir servicio/profesional/horario) debe
+     * resolverse con los datos ya conocidos de la conversación (CASO C/D), no volver a pedirlos
+     * ni quedarse en una promesa ("déjame verificar") sin ejecutar la consulta real.
+     */
     private ConversationResponse handleCheckAvailability(Business business, ConversationState state,
-                                                           ParsedAiReply parsed) {
-        Optional<Employee> employee = parsed.employeeName() != null
-                ? findEmployeeByName(business.getId(), parsed.employeeName())
+                                                           ParsedAiReply parsed, String rawMessage) {
+        String mergeFailure = mergeParsedIntoDraft(state, business, parsed, rawMessage);
+        if (mergeFailure != null) {
+            return finish(state, business, mergeFailure, ConversationIntent.CHECK_AVAILABILITY,
+                    parsed.confidence(), null);
+        }
+        autoResolveEmployeeIfUnambiguous(business.getId(), state);
+
+        Optional<Employee> employee = state.hasPendingEmployee()
+                ? employeeRepository.findByIdAndBusinessIdAndActiveTrue(state.getPendingEmployeeId(), business.getId())
                 : Optional.empty();
 
-        if (employee.isEmpty() || parsed.startAtText() == null) {
+        if (employee.isEmpty() || state.getPendingStartAt() == null) {
             return finish(state, business, parsed.reply(), ConversationIntent.CHECK_AVAILABILITY,
                     parsed.confidence(), null);
         }
+        rememberEmployee(state, employee.get());
 
-        Instant startAt;
-        try {
-            startAt = businessDateTimeResolver.resolve(parsed.startAtText(), business.getTimezone());
-        } catch (BusinessException ex) {
-            return finish(state, business, ex.getMessage(), ConversationIntent.CHECK_AVAILABILITY,
-                    parsed.confidence(), null);
-        }
+        String serviceName = state.hasPendingService()
+                ? serviceRepository.findByIdAndBusinessIdAndActiveTrue(state.getPendingServiceId(), business.getId())
+                        .map(Service::getName).orElse(null)
+                : null;
 
-        boolean available = isEmployeeAvailable(business, employee.get(), startAt, parsed.serviceName());
-        ZonedDateTime localStart = startAt.atZone(ZoneId.of(business.getTimezone()));
+        boolean available = isEmployeeAvailable(business, employee.get(), state.getPendingStartAt(), serviceName);
+        ZonedDateTime localStart = state.getPendingStartAt().atZone(ZoneId.of(business.getTimezone()));
         String time = LOCAL_TIME_FORMATTER.format(localStart);
         String reply = available
                 ? "Sí, " + employee.get().getFirstName() + " está disponible " + describeDate(localStart)
@@ -687,15 +786,18 @@ public class ConversationServiceImpl implements ConversationService {
     }
 
     private String describeDate(ZonedDateTime localStart) {
-        LocalDate date = localStart.toLocalDate();
-        LocalDate today = LocalDate.now(localStart.getZone());
+        return describeDateOnly(localStart.toLocalDate(), localStart.getZone());
+    }
+
+    private String describeDateOnly(LocalDate date, ZoneId zone) {
+        LocalDate today = LocalDate.now(zone);
         if (date.equals(today)) {
             return "hoy";
         }
         if (date.equals(today.plusDays(1))) {
             return "mañana";
         }
-        return "el " + LOCAL_DATE_FORMATTER.format(localStart);
+        return "el " + LOCAL_DATE_FORMATTER.format(date.atStartOfDay(zone));
     }
 
     private String employeeDisplayName(Employee employee) {
@@ -731,13 +833,17 @@ public class ConversationServiceImpl implements ConversationService {
     // Interacción con la IA (extracción de intención/entidades, nunca decisiones de negocio)
     // ---------------------------------------------------------------------------------------
 
-    private ParsedAiReply askAi(Business business, String message) {
-        String systemPrompt = systemPromptBuilder.build(buildBusinessContext(business));
+    private ParsedAiReply askAi(Business business, ConversationState state, String message) {
+        String systemPrompt = systemPromptBuilder.build(buildBusinessContext(business) + buildDraftContext(business, state));
         String rawAiReply = aiProvider.generateResponse(systemPrompt, message);
         ParsedAiReply parsed = parseAiReply(rawAiReply);
 
         log.info("Conversación IA recibida. businessId={}, intent={}, confidence={}",
                 business.getId(), parsed.intent(), parsed.confidence());
+        log.debug("Estado de la conversación antes de fusionar este turno. businessId={}, customerId={}, "
+                        + "stage={}, serviceId={}, employeeId={}, pendingDate={}, startAt={}",
+                business.getId(), state.getCustomerId(), state.getStage(), state.getPendingServiceId(),
+                state.getPendingEmployeeId(), state.getPendingDate(), state.getPendingStartAt());
 
         return parsed;
     }
@@ -793,6 +899,50 @@ public class ConversationServiceImpl implements ConversationService {
         }
 
         return context.toString();
+    }
+
+    /**
+     * Resume, en lenguaje natural, los datos de reserva ya recopilados en turnos anteriores
+     * (servicio, profesional, fecha/hora) para que la IA nunca tenga que "adivinar" a partir de
+     * un mensaje aislado. Sin este contexto, una respuesta elíptica como "para las 9" es
+     * indistinguible de un mensaje sin ningún dato: la IA no tiene forma de saber que el servicio
+     * y la fecha ya se resolvieron en un turno previo. Es solo contexto informativo para la IA;
+     * el backend nunca delega en ella la decisión de qué conservar (eso lo hace
+     * {@code mergeParsedIntoDraft}, que jamás pisa un dato ya resuelto con uno ausente).
+     */
+    private String buildDraftContext(Business business, ConversationState state) {
+        List<String> lines = new java.util.ArrayList<>();
+
+        if (state.hasPendingService()) {
+            serviceRepository.findByIdAndBusinessIdAndActiveTrue(state.getPendingServiceId(), business.getId())
+                    .ifPresent(service -> lines.add("- Servicio ya elegido: " + service.getName()));
+        }
+
+        if (state.hasPendingEmployee()) {
+            employeeRepository.findByIdAndBusinessIdAndActiveTrue(state.getPendingEmployeeId(), business.getId())
+                    .ifPresent(employee -> lines.add("- Profesional ya elegido: " + employeeDisplayName(employee)));
+        } else if (state.getLastReferencedEmployeeName() != null) {
+            lines.add("- Último profesional del que se habló (si el cliente dice \"con él\"/\"con ella\"/"
+                    + "\"el mismo\", se refiere a esta persona): " + state.getLastReferencedEmployeeName());
+        }
+
+        if (state.getPendingStartAt() != null) {
+            ZonedDateTime local = state.getPendingStartAt().atZone(ZoneId.of(business.getTimezone()));
+            lines.add("- Fecha y hora ya definidas: " + describeDateOnly(local.toLocalDate(), local.getZone())
+                    + " a las " + LOCAL_TIME_FORMATTER.format(local));
+        } else if (state.getPendingDate() != null) {
+            lines.add("- Fecha ya definida (todavía falta la hora): "
+                    + describeDateOnly(state.getPendingDate(), ZoneId.of(business.getTimezone())));
+        }
+
+        if (lines.isEmpty()) {
+            return "";
+        }
+
+        return "\nDatos que el cliente ya proporcionó en esta conversación (NO los vuelvas a pedir; si el "
+                + "mensaje actual no menciona un dato nuevo, dejalo como NONE en tu respuesta, no repitas ni "
+                + "cambies el valor ya conocido salvo que el cliente lo esté corrigiendo explícitamente):\n"
+                + String.join("\n", lines) + "\n";
     }
 
     private ParsedAiReply parseAiReply(String raw) {

@@ -24,7 +24,8 @@ public class ConfirmationClassifier {
     private static final List<String> NEGATIVE_TIME_PHRASES =
             List.of("otra hora", "otro horario", "otro dia", "otra fecha");
     private static final List<String> NEGATIVE_FULL_PHRASES = List.of("mejor no");
-    private static final Set<String> NEGATIVE_FULL_WORDS = Set.of("no", "cancelar", "cambiemos");
+    private static final Set<String> NEGATIVE_FULL_WORDS =
+            Set.of("no", "cancelar", "cambiemos", "olvidalo", "dejemos");
 
     private static final List<String> POSITIVE_PHRASES = List.of("esta bien", "de acuerdo");
     private static final Set<String> POSITIVE_WORDS = Set.of("si", "confirmo", "dale", "correcto", "ok");

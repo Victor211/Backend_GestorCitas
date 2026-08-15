@@ -48,3 +48,6 @@ app:
     app-secret: ${WHATSAPP_APP_SECRET}
     graph-api-version: ${WHATSAPP_GRAPH_API_VERSION}
     base-url: ${WHATSAPP_BASE_URL}
+    # Minutos de inactividad tras los cuales una conversación (ConversationState) se considera
+    # abandonada: se limpia el borrador de reserva y el saludo, sin borrar el Customer.
+    conversation-timeout-minutes: ${WHATSAPP_CONVERSATION_TIMEOUT_MINUTES:30}

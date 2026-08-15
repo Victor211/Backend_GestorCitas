@@ -177,6 +177,7 @@ Authorization: Bearer <accessToken>
 | `WHATSAPP_GRAPH_API_VERSION` | Versión de la Graph API a usar, por ejemplo `v21.0`. Sin valor por defecto (nunca hardcodeada en el código). |
 | `WHATSAPP_BASE_URL` | Host base de la Graph API. Ejemplo conceptual: `https://graph.facebook.com`. Sin valor por defecto. |
 | `WHATSAPP_CONNECT_TIMEOUT_MS` / `WHATSAPP_READ_TIMEOUT_MS` | Opcionales. Timeouts del cliente HTTP hacia Meta, en milisegundos. Por defecto `5000` / `15000`. |
+| `WHATSAPP_CONVERSATION_TIMEOUT_MINUTES` | Opcional. Minutos de inactividad tras los cuales se considera abandonada una conversación (`ConversationState`) y se limpia su borrador de reserva. Por defecto `30`. No es un secreto. |
 
 **Ninguna de estas variables tiene un valor real en este repositorio.** No subas tokens ni secrets reales a ningún archivo versionado.
 
@@ -221,10 +222,23 @@ ninguna regla de negocio real que lo exija.
 memoria de la conversación se persiste en una tabla JPA más (`conversation_states`, una fila por
 `business_id + customer_phone`, creada automáticamente por `ddl-auto: update` como el resto del
 esquema). Guarda qué datos de una reserva ya se recopilaron (`pendingServiceId`, `pendingEmployeeId`,
-`pendingDate`/`pendingStartAt`), si ya se saludó una vez (`greeted`) y si hay una propuesta esperando
-confirmación (`stage = AWAITING_CONFIRMATION`). Una propuesta pendiente que nadie confirma ni rechaza
-expira a los 20 minutos de inactividad (`ConversationStateStore.PENDING_CONFIRMATION_TTL`), verificado
-de forma perezosa al leer el estado — no hay ningún job/scheduler adicional.
+`pendingDate`/`pendingStartAt`), el último profesional del que se habló (`lastReferencedEmployeeId`,
+para resolver "con él"/"el mismo"), si ya se saludó una vez (`greeted`) y si hay una propuesta esperando
+confirmación (`stage = AWAITING_CONFIRMATION`).
+
+*Ciclo de vida.* Un borrador — en cualquier etapa, no solo `AWAITING_CONFIRMATION` — expira tras
+`app.whatsapp.conversation-timeout-minutes` (`WHATSAPP_CONVERSATION_TIMEOUT_MINUTES`, default 30
+minutos) de inactividad. `ConversationStateStore` lo verifica de forma perezosa al leer el estado,
+comparando contra `updatedAt` (ya se refresca solo en cada turno, vía JPA auditing) — no hay ningún
+job/scheduler adicional. Al vencer, se limpia el borrador de reserva y también `greeted`/`awaitingName`
+(la conversación arranca con el saludo completo de nuevo), pero **nunca** se toca la identidad:
+`customerId` se vuelve a resolver contra `sender_phone` en cada turno, independientemente de si el
+estado venció. Si lo que venció fue justo una propuesta `AWAITING_CONFIRMATION`, un "sí" tardío no crea
+la cita: se responde que la propuesta venció y se pide repetir el horario. Además: una reserva creada
+con éxito limpia su propio borrador (`handleConfirmation`); una cancelación explícita ("cancelar", "ya
+no quiero", "olvídalo", "dejemos") en cualquier etapa de la recopilación limpia el borrador sin esperar
+a `AWAITING_CONFIRMATION`; y una petición explícita de reinicio ("empezar de nuevo", "otra reserva")
+limpia el borrador sin perder al cliente ya identificado.
 
 **Interpretación de fecha/hora (`BusinessDateTimeResolver`).** Toda referencia relativa ("hoy",
 "mañana", "el próximo lunes") y toda desambiguación AM/PM se resuelve usando `Business.timezone`

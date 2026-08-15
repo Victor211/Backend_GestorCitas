@@ -7,6 +7,7 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 import jakarta.persistence.UniqueConstraint;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -68,6 +69,28 @@ public class ConversationState extends BaseEntity {
     @Column(name = "pending_notes", length = 500)
     private String pendingNotes;
 
+    /**
+     * Último Employee mencionado o resuelto en la conversación (por nombre explícito,
+     * auto-asignación sin ambigüedad, o consulta de disponibilidad), aunque todavía no sea el
+     * empleado elegido para la reserva en curso. Permite resolver referencias pronominales como
+     * "con él"/"el mismo" sin volver a preguntar el profesional. No se limpia junto con el
+     * borrador de reserva: es memoria conversacional de más largo alcance que un intento puntual.
+     */
+    @Column(name = "last_referenced_employee_id")
+    private Long lastReferencedEmployeeId;
+
+    @Column(name = "last_referenced_employee_name", length = 200)
+    private String lastReferencedEmployeeName;
+
+    /**
+     * Marca transitoria (no persistida) que {@code ConversationStateStore} activa cuando el
+     * estado recuperado estaba en {@code AWAITING_CONFIRMATION} pero venció por inactividad. Le
+     * permite al orquestador responder "esa propuesta ya venció" en lugar de crear una cita a
+     * partir de un "sí" desfasado, sin necesitar una columna nueva en base de datos.
+     */
+    @Transient
+    private boolean expiredPendingConfirmation = false;
+
     public boolean hasCustomer() {
         return customerId != null;
     }
@@ -91,6 +114,21 @@ public class ConversationState extends BaseEntity {
         this.pendingStartAt = null;
         this.pendingNotes = null;
         this.stage = ConversationStage.COLLECTING;
+    }
+
+    /**
+     * Trata la conversación como si empezara de cero: limpia el borrador de reserva y también el
+     * saludo/nombre-en-espera y la última referencia pronominal, ya que todos pertenecen a una
+     * interacción que ya se considera abandonada. La identidad (customerId/businessId/phone) NO
+     * se toca: {@code sender_phone -> Customer} es permanente y se vuelve a resolver contra la
+     * base real en cada turno, independientemente de la vigencia de este estado.
+     */
+    public void resetForNewConversation() {
+        clearBookingDraft();
+        this.greeted = false;
+        this.awaitingName = false;
+        this.lastReferencedEmployeeId = null;
+        this.lastReferencedEmployeeName = null;
     }
 
 }

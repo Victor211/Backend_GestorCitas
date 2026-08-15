@@ -9,6 +9,7 @@ import com.victor.appointmentmanager.api.modules.ai.entity.ConversationState;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationIntent;
 import com.victor.appointmentmanager.api.modules.ai.prompt.SystemPromptBuilder;
 import com.victor.appointmentmanager.api.modules.ai.repository.ConversationStateRepository;
+import com.victor.appointmentmanager.api.modules.appointments.dto.request.CreateAppointmentRequest;
 import com.victor.appointmentmanager.api.modules.appointments.dto.response.AppointmentResponse;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
@@ -16,6 +17,7 @@ import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
 import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
 import com.victor.appointmentmanager.api.modules.employees.repository.EmployeeRepository;
+import com.victor.appointmentmanager.api.modules.schedule.entity.Schedule;
 import com.victor.appointmentmanager.api.modules.schedule.repository.ScheduleRepository;
 import com.victor.appointmentmanager.api.modules.services.entity.Service;
 import com.victor.appointmentmanager.api.modules.services.repository.ServiceRepository;
@@ -25,6 +27,7 @@ import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -33,7 +36,10 @@ import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 
 import java.math.BigDecimal;
+import java.time.DayOfWeek;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -109,6 +115,9 @@ class ConversationServiceImplTest {
         lenient().when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
                         eq(1L), eq(""), any(Pageable.class)))
                 .thenReturn(Page.empty());
+        lenient().when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(Page.empty());
         lenient().when(scheduleRepository.findActiveByBusiness(1L, null, null)).thenReturn(List.of());
 
         lenient().when(conversationStateRepository.findByBusinessIdAndCustomerPhone(anyLong(), anyString()))
@@ -132,7 +141,7 @@ class ConversationServiceImplTest {
             return customer;
         });
 
-        ConversationStateStore conversationStateStore = new ConversationStateStore(conversationStateRepository);
+        ConversationStateStore conversationStateStore = new ConversationStateStore(conversationStateRepository, 30L);
         CustomerIdentityResolver customerIdentityResolver = new CustomerIdentityResolver(customerRepository);
         ConfirmationClassifier confirmationClassifier = new ConfirmationClassifier();
         com.victor.appointmentmanager.api.modules.ai.format.GuaraniAmountFormatter guaraniAmountFormatter =
@@ -146,6 +155,17 @@ class ConversationServiceImplTest {
 
     private static String key(Long businessId, String phone) {
         return businessId + ":" + phone;
+    }
+
+    /**
+     * Simula que pasó tiempo desde el último turno, retrocediendo {@code updatedAt} del estado
+     * persistido. En una app real ese campo lo actualiza Hibernate auditing en cada
+     * {@code save()}; en estos tests unitarios (sin contexto JPA) hay que fijarlo a mano para
+     * poder probar la política de expiración de {@code ConversationStateStore}.
+     */
+    private void backdateState(Long businessId, String phone, Duration ago) {
+        ConversationState state = statesByKey.get(key(businessId, phone));
+        state.setUpdatedAt(Instant.now().minus(ago));
     }
 
     private void stubAi(String userMessage, String rawResponse) {
@@ -197,7 +217,19 @@ class ConversationServiceImplTest {
         for (Employee employee : employees) {
             lenient().when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(employee.getId(), 1L))
                     .thenReturn(Optional.of(employee));
+            lenient().when(employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
+                            eq(1L), eq(employee.getFirstName()), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.of(employee)));
         }
+    }
+
+    private void stubFullDaySchedule(Employee employee) {
+        Schedule schedule = new Schedule();
+        schedule.setStartTime(LocalTime.of(0, 0));
+        schedule.setEndTime(LocalTime.of(23, 59));
+        lenient().when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(
+                        eq(employee.getId()), any(DayOfWeek.class)))
+                .thenReturn(List.of(schedule));
     }
 
     /** Lleva la conversación hasta AWAITING_CONFIRMATION con un único empleado habilitado. */
@@ -539,6 +571,439 @@ class ConversationServiceImplTest {
         assertThat(result.getIntent()).isEqualTo(ConversationIntent.UNKNOWN);
         assertThat(result.getAppointmentId()).isNull();
         assertThat(result.getReply()).isNotBlank();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Corrección: estado conversacional acumulativo. Un dato ya recopilado (servicio, fecha,
+    // profesional) no debe perderse porque un mensaje posterior solo aporte un dato nuevo.
+    // ---------------------------------------------------------------------------------------
+
+    // TEST 1 / TEST 5
+    @Test
+    void serviceAndDateSurviveAcrossTurnsWhenOnlyTimeIsAddedNext() {
+        String phone = "+595981555001";
+        existingCustomer(phone, "Cristian");
+        Service corteBarba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corteBarba);
+        stubServiceLookup("Corte Barba", corteBarba);
+        stubEmployeeListing(juan);
+
+        stubAi("Quiero un corte barba hoy",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte Barba\nSTART_AT: hoy\nCONFIDENCE: 0.8\n"
+                        + "REPLY: no importa");
+        ConversationResponse first = conversationService.processChannelConversation(
+                1L, phone, "Quiero un corte barba hoy");
+        assertThat(first.getReply()).contains("¿A qué hora te gustaría?");
+
+        stubAi("Para las 9", "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 9\nCONFIDENCE: 0.7\nREPLY: no importa");
+        ConversationResponse second = conversationService.processChannelConversation(1L, phone, "Para las 9");
+
+        // No debe pedir de nuevo servicio ni fecha, ni "olvidarlos": el mensaje debe reflejar
+        // ambos datos ya conocidos en la propuesta de confirmación.
+        assertThat(second.getReply()).doesNotContain("¿Qué servicio");
+        assertThat(second.getReply()).doesNotContain("¿Para cuándo");
+        assertThat(second.getReply()).contains("Corte Barba");
+        assertThat(second.getReply()).contains("Juan Gómez");
+        assertThat(second.getReply()).contains("¿Confirmás?");
+    }
+
+    // TEST 2
+    @Test
+    void pronounReferenceResolvesToLastMentionedEmployeeWithoutAskingAgain() {
+        String phone = "+595981555003";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+        stubFullDaySchedule(juan);
+
+        stubAi("¿Juan está disponible hoy a las 10?",
+                "INTENT: CHECK_AVAILABILITY\nEMPLOYEE_NAME: Juan\nSTART_AT: hoy a las 10\nCONFIDENCE: 0.8\n"
+                        + "REPLY: no importa");
+        ConversationResponse availability = conversationService.processChannelConversation(
+                1L, phone, "¿Juan está disponible hoy a las 10?");
+        assertThat(availability.getReply()).contains("disponible");
+
+        stubAi("Quiero reservar con él",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nCONFIDENCE: 0.6\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero reservar con él");
+
+        assertThat(result.getReply()).doesNotContain("¿Con qué profesional");
+        assertThat(result.getReply()).contains("Juan Gómez");
+    }
+
+    // TEST 3 / TEST 8
+    @Test
+    void checkAvailabilityQuestionReusesExistingDraftAndExecutesImmediately() {
+        String phone = "+595981555004";
+        existingCustomer(phone, "Cristian");
+        Employee juan = employee(3L, "Juan", "Gómez");
+        stubEmployeeListing(juan);
+        stubFullDaySchedule(juan);
+
+        stubAi("¿Juan está disponible hoy a las 10?",
+                "INTENT: CHECK_AVAILABILITY\nEMPLOYEE_NAME: Juan\nSTART_AT: hoy a las 10\nCONFIDENCE: 0.8\n"
+                        + "REPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "¿Juan está disponible hoy a las 10?");
+
+        stubAi("¿Está disponible?",
+                "INTENT: CHECK_AVAILABILITY\nCONFIDENCE: 0.6\nREPLY: Déjame verificar la disponibilidad.");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "¿Está disponible?");
+
+        // Debe ejecutar la consulta real con los datos ya conocidos (empleado/horario), no
+        // repetir la promesa de la IA ni volver a pedir servicio/día/horario.
+        assertThat(result.getReply()).doesNotContain("Déjame verificar");
+        assertThat(result.getReply()).contains("disponible");
+        assertThat(result.getReply()).doesNotContain("¿Qué servicio");
+    }
+
+    // TEST 8 (variante desde el flujo de reserva normal)
+    @Test
+    void sufficientDataInASingleMessageNeverLeavesAPlaceholderPromiseUnexecuted() {
+        String phone = "+595981555005";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        existingCustomer(phone, "Cristian");
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+
+        stubAi("Déjame reservar con Juan hoy a las 9",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nEMPLOYEE_NAME: Juan\nSTART_AT: hoy a las 9\n"
+                        + "CONFIDENCE: 0.8\nREPLY: Déjame verificar la disponibilidad para ese horario.");
+
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Déjame reservar con Juan hoy a las 9");
+
+        assertThat(result.getReply()).doesNotContain("Déjame verificar");
+        assertThat(result.getReply()).contains("¿Confirmás?");
+        assertThat(result.getAppointmentId()).isNull();
+    }
+
+    // TEST 4
+    @Test
+    void dateDoesNotMutateAcrossSeveralFollowUpMessages() {
+        String phone = "+595981555002";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+
+        stubAi("Quiero un corte hoy",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: hoy\nCONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte hoy");
+
+        stubAi("¿Cuánto cuesta?", "INTENT: UNKNOWN\nCONFIDENCE: 0.3\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "¿Cuánto cuesta?");
+
+        stubAi("Para las 9", "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 9\nCONFIDENCE: 0.7\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Para las 9");
+
+        assertThat(result.getReply()).contains("hoy");
+        assertThat(result.getReply()).doesNotContain("mañana");
+    }
+
+    // TEST 6 / TEST 7: durante la confirmación, cambiar un solo dato conserva el resto
+    @Test
+    void changingOnlyTheTimeDuringConfirmationKeepsServiceAndEmployee() {
+        String phone = "+595981555008";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+
+        stubAi("Mejor a las 10", "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 10\nCONFIDENCE: 0.6\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Mejor a las 10");
+
+        assertThat(result.getReply()).contains("10:00");
+        assertThat(result.getReply()).contains("Corte");
+        assertThat(result.getReply()).contains("Juan Gómez");
+        assertThat(result.getReply()).contains("¿Confirmás?");
+    }
+
+    @Test
+    void changingOnlyTheDateDuringConfirmationKeepsServiceEmployeeAndTime() {
+        String phone = "+595981555007";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+
+        stubAi("Mejor el próximo lunes",
+                "INTENT: BOOK_APPOINTMENT\nSTART_AT: el próximo lunes a las 14\nCONFIDENCE: 0.6\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Mejor el próximo lunes");
+
+        assertThat(result.getReply()).contains("Corte");
+        assertThat(result.getReply()).contains("Juan Gómez");
+        assertThat(result.getReply()).contains("¿Confirmás?");
+        assertThat(result.getAppointmentId()).isNull();
+    }
+
+    // TEST 9
+    @Test
+    void confirmationUsesExactlyTheServiceEmployeeAndStartAtFromTheProposal() {
+        String phone = "+595981555006";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+
+        ArgumentCaptor<CreateAppointmentRequest> captor = ArgumentCaptor.forClass(CreateAppointmentRequest.class);
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(500L);
+        response.setServiceName("Corte");
+        response.setEmployeeName("Juan Gómez");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), captor.capture())).thenReturn(response);
+
+        conversationService.processChannelConversation(1L, phone, "Sí");
+
+        CreateAppointmentRequest used = captor.getValue();
+        assertThat(used.getServiceId()).isEqualTo(4L);
+        assertThat(used.getEmployeeId()).isEqualTo(3L);
+        assertThat(used.getStartAt()).isNotNull();
+    }
+
+    // TEST 10
+    @Test
+    void plainGreetingNeverAsksForServiceNameOrCreatesCustomer() {
+        String phone = "+595981555009";
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\n"
+                + "REPLY: ¿Te ayudo a reservar un turno o necesitas información sobre nuestros servicios?");
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Hola");
+
+        assertThat(result.getReply()).doesNotContain("¿Qué servicio");
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Corrección: ciclo de vida de ConversationState. La memoria conversacional no debe
+    // sobrevivir indefinidamente: un borrador abandonado (en cualquier etapa, no solo
+    // AWAITING_CONFIRMATION) debe expirar por inactividad, y una reserva completada o cancelada
+    // debe dejar la conversación limpia para el próximo mensaje.
+    // ---------------------------------------------------------------------------------------
+
+    // TEST 1
+    @Test
+    void activeDraftWithinTimeoutPreservesServiceAndDateWhenOnlyTimeArrives() {
+        String phone = "+595981666001";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+
+        stubAi("Quiero un corte hoy",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: hoy\nCONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte hoy");
+
+        backdateState(1L, phone, Duration.ofMinutes(5));
+
+        stubAi("Para las 10", "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 10\nCONFIDENCE: 0.7\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Para las 10");
+
+        assertThat(result.getReply()).contains("Corte");
+        assertThat(result.getReply()).contains("¿Confirmás?");
+    }
+
+    // TEST 2
+    @Test
+    void expiredDraftIsNotReusedWhenPlainGreetingArrivesLater() {
+        String phone = "+595981666002";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        stubServiceLookup("Corte", corte);
+
+        stubAi("Quiero un corte hoy",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: hoy\nCONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte hoy");
+
+        backdateState(1L, phone, Duration.ofMinutes(60));
+
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\n"
+                + "REPLY: ¿Te ayudo a reservar un turno o necesitas información?");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Hola");
+
+        assertThat(result.getReply()).doesNotContain("¿A qué hora");
+        assertThat(result.getReply()).contains("Peluquería Elegance");
+    }
+
+    // TEST 3
+    @Test
+    void expiredStatePlusNewBookingMessageStartsFreshUsingOnlyNewData() {
+        String phone = "+595981666003";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Service color = service(5L, "Coloración", new BigDecimal("150000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte, color);
+        stubServiceLookup("Corte", corte);
+        stubServiceLookup("Coloración", color);
+        stubEmployeeListing(juan);
+
+        stubAi("Quiero una coloración hoy", "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Coloración\nSTART_AT: hoy\n"
+                + "CONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero una coloración hoy");
+
+        backdateState(1L, phone, Duration.ofMinutes(60));
+
+        stubAi("Quiero reservar un corte mañana a las 11",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: mañana a las 11\nCONFIDENCE: 0.8\n"
+                        + "REPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero reservar un corte mañana a las 11");
+
+        assertThat(result.getReply()).contains("Corte");
+        assertThat(result.getReply()).doesNotContain("Coloración");
+        assertThat(result.getReply()).contains("¿Confirmás?");
+    }
+
+    // TEST 4
+    @Test
+    void completedAppointmentDoesNotLeakIntoTheNextGreeting() {
+        String phone = "+595981666004";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(700L);
+        response.setServiceName("Corte");
+        response.setEmployeeName("Juan Gómez");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
+        conversationService.processChannelConversation(1L, phone, "Sí");
+
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\nREPLY: ¿En qué puedo ayudarte?");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Hola");
+
+        assertThat(result.getReply()).doesNotContain("¿Confirmás?");
+        assertThat(result.getReply()).doesNotContain("Corte");
+        assertThat(result.getReply()).doesNotContain("¿A qué hora");
+    }
+
+    // TEST 5
+    @Test
+    void explicitCancellationDuringCollectionClearsDraftAndNextGreetingIsClean() {
+        String phone = "+595981666005";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        stubServiceLookup("Corte", corte);
+
+        stubAi("Quiero un corte hoy",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: hoy\nCONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte hoy");
+
+        ConversationResponse cancelled = conversationService.processChannelConversation(1L, phone, "Cancelar");
+        assertThat(cancelled.getReply()).contains("cancelé");
+        assertThat(cancelled.getIntent()).isEqualTo(ConversationIntent.REJECT_APPOINTMENT);
+
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\nREPLY: ¿En qué puedo ayudarte?");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Hola");
+
+        assertThat(result.getReply()).doesNotContain("¿A qué hora");
+    }
+
+    // TEST 6
+    @Test
+    void expiredStateStillReusesExistingCustomerWithoutAskingPhoneOrDuplicating() {
+        String phone = "+595981666006";
+        Customer cristian = existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        stubServiceLookup("Corte", corte);
+
+        stubAi("Quiero un corte hoy",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: hoy\nCONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte hoy");
+
+        backdateState(1L, phone, Duration.ofMinutes(60));
+
+        stubAi("Quiero reservar", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Quiero reservar");
+
+        assertThat(result.getReply().toLowerCase()).doesNotContain("teléfono").doesNotContain("telefono");
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).hasSize(1);
+        assertThat(customersByPhone.get(phone).getId()).isEqualTo(cristian.getId());
+    }
+
+    // TEST 7
+    @Test
+    void validPendingConfirmationStillCreatesAppointmentWhenConfirmedInTime() {
+        String phone = "+595981666007";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+
+        backdateState(1L, phone, Duration.ofMinutes(10));
+
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(800L);
+        response.setServiceName("Corte");
+        response.setEmployeeName("Juan Gómez");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Sí");
+
+        assertThat(result.getAppointmentId()).isEqualTo(800L);
+        verify(appointmentService).create(eq(1L), any());
+    }
+
+    // TEST 8
+    @Test
+    void expiredPendingConfirmationDoesNotCreateAppointmentEvenWithPositiveReply() {
+        String phone = "+595981666008";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        proposeCorteBooking(phone, corte, juan);
+
+        backdateState(1L, phone, Duration.ofMinutes(60));
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Sí");
+
+        assertThat(result.getAppointmentId()).isNull();
+        assertThat(result.getReply()).contains("venció");
+        verify(appointmentService, never()).create(any(), any());
+    }
+
+    // TEST 9
+    @Test
+    void greetingCombinedWithNewDataWithinTimeoutStillExtractsTheData() {
+        String phone = "+595981666009";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+
+        stubAi("Quiero un corte hoy",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: hoy\nCONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte hoy");
+
+        stubAi("Hola, perdón, a las 10",
+                "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 10\nCONFIDENCE: 0.7\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Hola, perdón, a las 10");
+
+        assertThat(result.getReply()).contains("10:00");
+        assertThat(result.getReply()).contains("¿Confirmás?");
+    }
+
+    // TEST 10
+    @Test
+    void pureGreetingInACleanConversationOnlyOffersHelp() {
+        String phone = "+595981666010";
+        stubAi("Hola", "INTENT: GREETING\nCONFIDENCE: 0.9\n"
+                + "REPLY: ¿Te ayudo a reservar un turno o necesitas información sobre nuestros servicios?");
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Hola");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(result.getReply()).doesNotContain("¿Qué servicio");
+        assertThat(result.getReply()).doesNotContain("¿A qué hora");
+        assertThat(result.getReply()).doesNotContain("¿Para cuándo");
     }
 
 }
