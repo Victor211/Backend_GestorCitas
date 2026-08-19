@@ -1084,6 +1084,146 @@ class ConversationServiceImplTest {
         assertThat(result.getReply()).doesNotContain("profesional");
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Bug reportado en QA (segunda vuelta): la respuesta corta "Corte premium"/"Corte barba"
+    // seguía re-listando los servicios pese al ajuste anterior, porque la IA la clasificaba como
+    // LIST_SERVICES — una rama de respondCollecting que corta el flujo ANTES de llegar a
+    // mergeParsedIntoDraft (donde vivía el fix anterior). La resolución determinista ahora corre
+    // ANTES de invocar a la IA: si el mensaje coincide exacto/normalizado con un único Service
+    // activo, se resuelve sin siquiera preguntarle al modelo, así el resultado no depende de qué
+    // intent le asigne a un mensaje ambiguo. No se stubea la IA para el mensaje corto en estos
+    // tests a propósito: si el código intentara clasificarlo, el mock lanzaría un mismatch.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void shortServiceSelectionReplyResolvesServiceWithoutRelistingCatalogAndContinuesToDateTime() {
+        String phone = "+595981999001";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        Employee juan = employee(3L, "Juan", "Gómez", premium);
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(premium, barba)));
+        stubServiceLookup("Corte Premium", premium);
+        stubEmployeeListing(juan);
+
+        stubAi("Me gustaría reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        ConversationResponse first = conversationService.processChannelConversation(
+                1L, phone, "Me gustaría reservar un turno");
+        assertThat(first.getReply()).contains("• Corte Premium — Gs. 65.000");
+        assertThat(first.getReply()).contains("• Corte Barba — Gs. 45.000");
+
+        ConversationResponse second = conversationService.processChannelConversation(1L, phone, "Corte premium");
+
+        assertThat(second.getReply()).doesNotContain("• Corte Premium");
+        assertThat(second.getReply()).doesNotContain("• Corte Barba");
+        assertThat(second.getReply()).doesNotContain("¿Cuál te gustaría reservar?");
+        assertThat(second.getReply()).contains("¿Para cuándo te gustaría el turno?");
+        verify(aiProvider, never()).generateResponse(anyString(), eq("Corte premium"));
+
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getPendingServiceId()).isEqualTo(4L);
+
+        stubAi("Mañana a las 10", "INTENT: BOOK_APPOINTMENT\nSTART_AT: mañana a las 10\nCONFIDENCE: 0.7\n"
+                + "REPLY: no importa");
+        ConversationResponse third = conversationService.processChannelConversation(1L, phone, "Mañana a las 10");
+        assertThat(third.getReply()).contains("¿Confirmás?");
+        assertThat(third.getAppointmentId()).isNull();
+
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(600L);
+        response.setServiceName("Corte Premium");
+        response.setEmployeeName("Juan Gómez");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
+
+        ConversationResponse fourth = conversationService.processChannelConversation(1L, phone, "Sí");
+        assertThat(fourth.getAppointmentId()).isEqualTo(600L);
+    }
+
+    @Test
+    void secondShortServiceSelectionReplySelectsCorteBarbaWithoutRelistingCatalog() {
+        String phone = "+595981999002";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(premium, barba)));
+
+        stubAi("Me gustaría reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Me gustaría reservar un turno");
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Corte barba");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál te gustaría reservar?");
+        assertThat(result.getReply()).doesNotContain("• Corte Premium");
+        verify(aiProvider, never()).generateResponse(anyString(), eq("Corte barba"));
+
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getPendingServiceId()).isEqualTo(6L);
+    }
+
+    @Test
+    void fullSentenceServiceSelectionStillGoesThroughAiExtraction() {
+        String phone = "+595981999003";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(premium)));
+        stubServiceLookup("Corte Premium", premium);
+
+        stubAi("Me gustaría reservar corte premium",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte Premium\nCONFIDENCE: 0.85\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Me gustaría reservar corte premium");
+
+        assertThat(result.getReply()).contains("¿Para cuándo te gustaría el turno?");
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getPendingServiceId()).isEqualTo(4L);
+    }
+
+    @Test
+    void shortServiceSelectionReplyIsCaseInsensitive() {
+        String phone = "+595981999004";
+        existingCustomer(phone, "Cristian");
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(barba)));
+
+        stubAi("Quiero reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero reservar un turno");
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "CORTE BARBA");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál te gustaría reservar?");
+        verify(aiProvider, never()).generateResponse(anyString(), eq("CORTE BARBA"));
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getPendingServiceId()).isEqualTo(6L);
+    }
+
+    @Test
+    void newCustomerShortServiceSelectionIsNeverMisreadAsCustomerName() {
+        String phone = "+595981999005";
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(barba)));
+
+        stubAi("Quiero reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero reservar un turno");
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Corte barba");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getPendingServiceId()).isEqualTo(6L);
+    }
+
     // TEST 3
     @Test
     void selectingServiceDoesNotAskForEmployeeBeforeDateAndTime() {

@@ -249,6 +249,20 @@ public class ConversationServiceImpl implements ConversationService {
             state.clearBookingDraft();
         }
 
+        // Resolución determinista PRIMERO: si todavía no hay servicio elegido y el mensaje
+        // coincide, exacto y normalizado, con un único Service activo, se resuelve sin pasar por
+        // la IA — antes de que cualquier clasificación de intent (incluido un LIST_SERVICES mal
+        // asignado a una respuesta corta) pueda cortar el flujo. Ver matchSingleActiveService.
+        if (!state.hasPendingService()) {
+            Optional<Service> directMatch = matchSingleActiveService(business.getId(), message);
+            if (directMatch.isPresent()) {
+                state.setPendingServiceId(directMatch.get().getId());
+                DispatchOutcome outcome = advanceBookingFlow(business, state);
+                return finishFromOutcome(state, business, outcome, ConversationIntent.BOOK_APPOINTMENT,
+                        DETERMINISTIC_CONFIDENCE);
+            }
+        }
+
         ParsedAiReply parsed = askAi(business, state, message);
 
         if (parsed.intent() == ConversationIntent.LIST_SERVICES) {
@@ -629,6 +643,45 @@ public class ConversationServiceImpl implements ConversationService {
         }
 
         return null;
+    }
+
+    private static final Pattern SERVICE_MATCH_VERB_LEAD_IN = Pattern.compile(
+            "(?i)^(?:quiero|prefiero|quisiera|dame)\\s+");
+    private static final Pattern SERVICE_MATCH_ARTICLE_LEAD_IN = Pattern.compile("(?i)^(?:el|la)\\s+");
+
+    /**
+     * Resuelve el mensaje del cliente directamente contra los Services activos, sin pasar por la
+     * IA. Se consulta en {@code respondCollecting} ANTES de clasificar con el modelo — no como
+     * respaldo posterior — porque una respuesta corta y sin verbo ("Corte premium") puede ser
+     * reclasificada por la IA como {@code LIST_SERVICES} (no solo como {@code BOOK_APPOINTMENT}
+     * sin SERVICE_NAME), y esa rama corta el flujo antes de llegar a cualquier fusión de datos. Al
+     * resolver el match determinístico primero, el resultado deja de depender de qué intent le
+     * asigne el modelo a un mensaje ambiguo. Match exacto/normalizado únicamente (mayúsculas,
+     * acentos, espacios externos y un prefijo simple de verbo/artículo) — nunca fuzzy matching. Si
+     * el mensaje normalizado coincide con más de un servicio activo, no arriesga una elección
+     * ambigua: devuelve vacío y el flujo sigue su curso normal (clasificación por IA).
+     */
+    private Optional<Service> matchSingleActiveService(Long businessId, String rawMessage) {
+        if (rawMessage == null) {
+            return Optional.empty();
+        }
+        String normalizedMessage = normalizeForServiceMatch(rawMessage);
+        if (normalizedMessage.isEmpty()) {
+            return Optional.empty();
+        }
+        List<Service> matches = activeServices(businessId).stream()
+                .filter(candidate -> normalizedMessage.equals(normalizeForServiceMatch(candidate.getName())))
+                .toList();
+        return matches.size() == 1 ? Optional.of(matches.get(0)) : Optional.empty();
+    }
+
+    private String normalizeForServiceMatch(String value) {
+        String lower = value.trim().toLowerCase(Locale.ROOT);
+        String withoutAccents = java.text.Normalizer.normalize(lower, java.text.Normalizer.Form.NFD)
+                .replaceAll("\\p{M}", "");
+        String withoutVerbLeadIn = SERVICE_MATCH_VERB_LEAD_IN.matcher(withoutAccents).replaceFirst("");
+        String withoutArticleLeadIn = SERVICE_MATCH_ARTICLE_LEAD_IN.matcher(withoutVerbLeadIn).replaceFirst("");
+        return withoutArticleLeadIn.replaceAll("\\s+", " ").trim();
     }
 
     private String resolveAndMergeStartAt(ConversationState state, Business business, String startAtText) {
