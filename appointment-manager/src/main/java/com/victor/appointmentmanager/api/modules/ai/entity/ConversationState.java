@@ -46,9 +46,6 @@ public class ConversationState extends BaseEntity {
     @Column(nullable = false)
     private boolean greeted = false;
 
-    @Column(nullable = false)
-    private boolean awaitingName = false;
-
     @Column(name = "pending_service_id")
     private Long pendingServiceId;
 
@@ -66,9 +63,6 @@ public class ConversationState extends BaseEntity {
     @Column(name = "pending_start_at")
     private Instant pendingStartAt;
 
-    @Column(name = "pending_notes", length = 500)
-    private String pendingNotes;
-
     /**
      * Último Employee mencionado o resuelto en la conversación (por nombre explícito,
      * auto-asignación sin ambigüedad, o consulta de disponibilidad), aunque todavía no sea el
@@ -84,9 +78,10 @@ public class ConversationState extends BaseEntity {
 
     /**
      * Marca transitoria (no persistida) que {@code ConversationStateStore} activa cuando el
-     * estado recuperado estaba en {@code AWAITING_CONFIRMATION} pero venció por inactividad. Le
-     * permite al orquestador responder "esa propuesta ya venció" en lugar de crear una cita a
-     * partir de un "sí" desfasado, sin necesitar una columna nueva en base de datos.
+     * estado recuperado estaba en {@code AWAITING_CONFIRMATION} o {@code AWAITING_CUSTOMER_NAME}
+     * pero venció por inactividad. Le permite al orquestador responder "esa propuesta ya venció"
+     * en lugar de crear una cita a partir de un "sí" o un nombre desfasados, sin necesitar una
+     * columna nueva en base de datos.
      */
     @Transient
     private boolean expiredPendingConfirmation = false;
@@ -112,21 +107,19 @@ public class ConversationState extends BaseEntity {
         this.pendingEmployeeId = null;
         this.pendingDate = null;
         this.pendingStartAt = null;
-        this.pendingNotes = null;
         this.stage = ConversationStage.COLLECTING;
     }
 
     /**
      * Trata la conversación como si empezara de cero: limpia el borrador de reserva y también el
-     * saludo/nombre-en-espera y la última referencia pronominal, ya que todos pertenecen a una
-     * interacción que ya se considera abandonada. La identidad (customerId/businessId/phone) NO
-     * se toca: {@code sender_phone -> Customer} es permanente y se vuelve a resolver contra la
-     * base real en cada turno, independientemente de la vigencia de este estado.
+     * saludo y la última referencia pronominal, ya que ambos pertenecen a una interacción que ya
+     * se considera abandonada. La identidad (customerId/businessId/phone) NO se toca:
+     * {@code sender_phone -> Customer} es permanente y se vuelve a resolver contra la base real en
+     * cada turno, independientemente de la vigencia de este estado.
      */
     public void resetForNewConversation() {
         clearBookingDraft();
         this.greeted = false;
-        this.awaitingName = false;
         this.lastReferencedEmployeeId = null;
         this.lastReferencedEmployeeName = null;
     }

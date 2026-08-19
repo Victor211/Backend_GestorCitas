@@ -8,6 +8,8 @@ import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationRes
 import com.victor.appointmentmanager.api.modules.ai.entity.ConversationState;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationIntent;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationStage;
+import com.victor.appointmentmanager.api.modules.ai.format.ConversationReplyFormatter;
+import com.victor.appointmentmanager.api.modules.ai.format.GuaraniAmountFormatter;
 import com.victor.appointmentmanager.api.modules.ai.prompt.SystemPromptBuilder;
 import com.victor.appointmentmanager.api.modules.ai.repository.ConversationStateRepository;
 import com.victor.appointmentmanager.api.modules.appointments.dto.request.CreateAppointmentRequest;
@@ -53,6 +55,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -128,6 +131,12 @@ class ConversationServiceImplTest {
         lenient().when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(
                         anyLong(), any(DayOfWeek.class)))
                 .thenReturn(List.of(openAllDay));
+        // Única fuente de verdad de disponibilidad: por defecto cualquier empleado se considera
+        // disponible (equivalente al "horario abierto todo el día" que antes simulaba el stub de
+        // arriba). Los tests que necesiten simular indisponibilidad lo sobreescriben explícitamente
+        // para el businessId/employeeId que corresponda.
+        lenient().when(appointmentService.isAvailable(anyLong(), anyLong(), nullable(Long.class), any(Instant.class)))
+                .thenReturn(true);
 
         lenient().when(conversationStateRepository.findByBusinessIdAndCustomerPhone(anyLong(), anyString()))
                 .thenAnswer(inv -> Optional.ofNullable(statesByKey.get(key(inv.getArgument(0), inv.getArgument(1)))));
@@ -153,13 +162,13 @@ class ConversationServiceImplTest {
         ConversationStateStore conversationStateStore = new ConversationStateStore(conversationStateRepository, 30L);
         CustomerIdentityResolver customerIdentityResolver = new CustomerIdentityResolver(customerRepository);
         ConfirmationClassifier confirmationClassifier = new ConfirmationClassifier();
-        com.victor.appointmentmanager.api.modules.ai.format.GuaraniAmountFormatter guaraniAmountFormatter =
-                new com.victor.appointmentmanager.api.modules.ai.format.GuaraniAmountFormatter();
+        GuaraniAmountFormatter guaraniAmountFormatter = new GuaraniAmountFormatter();
+        ConversationReplyFormatter replyFormatter = new ConversationReplyFormatter(guaraniAmountFormatter);
 
         conversationService = new ConversationServiceImpl(aiProvider, systemPromptBuilder, businessRepository,
                 serviceRepository, employeeRepository, scheduleRepository, appointmentRepository, appointmentService,
                 currentUserProvider, businessDateTimeResolver, conversationStateStore, customerIdentityResolver,
-                confirmationClassifier, guaraniAmountFormatter);
+                confirmationClassifier, replyFormatter, guaraniAmountFormatter);
     }
 
     private static String key(Long businessId, String phone) {
@@ -313,28 +322,50 @@ class ConversationServiceImplTest {
     }
 
     // ---------------------------------------------------------------------------------------
-    // AJUSTE 4/5: identificación de cliente por sender_phone
+    // Customer no es prerequisito para conversar: se identifica (y crea, si hace falta) recién
+    // al confirmar, nunca antes. sender_phone es la única fuente de verdad para el teléfono.
     // ---------------------------------------------------------------------------------------
 
     @Test
-    void newCustomerIsNeverAskedForPhoneAndGetsCreatedUsingSenderPhone() {
+    void newCustomerIsNeverAskedForPhoneAndConfirmsBeforeCreatingCustomerFromSenderPhone() {
         String phone = "+595987000001";
-        stubAi("Quiero reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+        stubAi("Quiero un corte mañana a las 14",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: mañana a las 14\n"
+                        + "CONFIDENCE: 0.9\nREPLY: no importa");
 
-        ConversationResponse first = conversationService.processChannelConversation(
-                1L, phone, "Quiero reservar un turno");
+        ConversationResponse proposal = conversationService.processChannelConversation(
+                1L, phone, "Quiero un corte mañana a las 14");
+        assertThat(proposal.getReply()).contains("¿Confirmás?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
 
-        assertThat(first.getReply().toLowerCase()).doesNotContain("teléfono").doesNotContain("telefono");
-        assertThat(first.getReply()).contains("¿Cuál es tu nombre?");
+        ConversationResponse afterYes = conversationService.processChannelConversation(1L, phone, "Sí");
+        assertThat(afterYes.getReply().toLowerCase()).doesNotContain("teléfono").doesNotContain("telefono");
+        assertThat(afterYes.getReply()).contains("¿Cuál es tu nombre?");
+        assertThat(afterYes.getAppointmentId()).isNull();
+        assertThat(customersByPhone).doesNotContainKey(phone);
 
-        ConversationResponse second = conversationService.processChannelConversation(1L, phone, "María López");
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(900L);
+        response.setServiceName("Corte");
+        response.setEmployeeName("Juan Gómez");
+        response.setCustomerName("María López");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
 
+        ConversationResponse afterName = conversationService.processChannelConversation(1L, phone, "María López");
+
+        // El "sí" anterior sigue siendo válido: no se vuelve a pedir confirmación.
+        assertThat(afterName.getReply()).doesNotContain("¿Confirmás?");
+        assertThat(afterName.getAppointmentId()).isEqualTo(900L);
         assertThat(customersByPhone).containsKey(phone);
         Customer created = customersByPhone.get(phone);
         assertThat(created.getPhone()).isEqualTo(phone);
         assertThat(created.getFirstName()).isEqualTo("María");
         assertThat(created.getLastName()).isEqualTo("López");
-        assertThat(second.getReply().toLowerCase()).doesNotContain("teléfono").doesNotContain("telefono");
     }
 
     @Test
@@ -401,20 +432,22 @@ class ConversationServiceImplTest {
     }
 
     @Test
-    void unknownNumberBookingIntentAsksForNameAndCreatesCustomerOnlyAfterNameProvided() {
+    void unknownNumberBookingIntentCollectsDataNormallyWithoutAskingNameUpfront() {
         String phone = "+595987111003";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(corte)));
         stubAi("Quiero reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
 
         ConversationResponse first = conversationService.processChannelConversation(
                 1L, phone, "Quiero reservar un turno");
 
-        assertThat(first.getReply()).contains("¿Cuál es tu nombre?");
+        // Sin servicio identificado, se muestra el catálogo — nunca se pide el nombre en este
+        // punto, esté o no identificado el Customer.
+        assertThat(first.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(first.getReply()).contains("Corte");
         assertThat(customersByPhone).doesNotContainKey(phone);
-
-        conversationService.processChannelConversation(1L, phone, "María López");
-
-        assertThat(customersByPhone).containsKey(phone);
-        assertThat(customersByPhone.get(phone).getPhone()).isEqualTo(phone);
     }
 
     @Test
@@ -454,14 +487,21 @@ class ConversationServiceImplTest {
     @Test
     void initialGreetingUsesBusinessNameAndStillAddressesTheOriginalMessageInTheSameTurn() {
         String phone = "+595987000002";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(corte)));
         stubAi("Hola, quiero reservar mañana a las 10",
                 "INTENT: BOOK_APPOINTMENT\nSTART_AT: mañana a las 10\nCONFIDENCE: 0.8\nREPLY: no importa");
 
         ConversationResponse result = conversationService.processChannelConversation(
                 1L, phone, "Hola, quiero reservar mañana a las 10");
 
+        // El saludo del negocio acompaña la primera respuesta, pero el turno avanza el flujo de
+        // reserva (catálogo) en vez de detenerse a pedir el nombre: Customer no es prerequisito.
         assertThat(result.getReply()).contains("Peluquería Elegance");
-        assertThat(result.getReply()).contains("¿Cuál es tu nombre?");
+        assertThat(result.getReply()).contains("Corte");
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
     }
 
     @Test
@@ -1013,6 +1053,8 @@ class ConversationServiceImplTest {
         assertThat(result.getReply()).doesNotContain("¿Qué servicio");
         assertThat(result.getReply()).doesNotContain("¿A qué hora");
         assertThat(result.getReply()).doesNotContain("¿Para cuándo");
+        // El saludo puro se redacta determinísticamente en backend, no con el texto libre de la IA.
+        assertThat(result.getReply()).contains("¿Te ayudo a reservar un turno");
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1181,7 +1223,10 @@ class ConversationServiceImplTest {
         assertThat(result.getReply()).doesNotContain("Victor");
     }
 
-    // TEST 18: disponibilidad debe considerar el Schedule real del empleado
+    // TEST 18: disponibilidad debe considerar el Schedule real del empleado. La regla de horario
+    // laboral vive en AppointmentServiceImpl (única fuente de verdad, expuesta vía
+    // AppointmentService#isAvailable); este test simula ese resultado a través del mismo método
+    // que ConversationServiceImpl consulta, sin duplicar la lógica de Schedule aquí.
     @Test
     void availabilityExcludesEmployeesOutsideTheirWorkingHours() {
         String phone = "+595981777018";
@@ -1190,13 +1235,8 @@ class ConversationServiceImplTest {
         Employee juan = employee(3L, "Juan", "Gómez", barba);
         stubServiceLookup("Corte Barba", barba);
         stubEmployeeListing(juan);
-
-        Schedule morningOnly = new Schedule();
-        morningOnly.setStartTime(LocalTime.of(8, 0));
-        morningOnly.setEndTime(LocalTime.of(12, 0));
-        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(
-                        eq(3L), any(DayOfWeek.class)))
-                .thenReturn(List.of(morningOnly));
+        when(appointmentService.isAvailable(eq(1L), eq(3L), nullable(Long.class), any(Instant.class)))
+                .thenReturn(false);
 
         stubAi("Corte Barba hoy a las 15:00",
                 "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte Barba\nSTART_AT: hoy a las 15:00\nCONFIDENCE: 0.8\n"
@@ -1207,7 +1247,8 @@ class ConversationServiceImplTest {
         assertThat(result.getReply()).contains("No hay disponibilidad");
     }
 
-    // TEST 19: disponibilidad debe considerar superposición con otras citas
+    // TEST 19: disponibilidad debe considerar superposición con otras citas. Misma nota que el
+    // test anterior: la regla de overlap vive en AppointmentServiceImpl, no aquí.
     @Test
     void availabilityExcludesEmployeesWithOverlappingAppointment() {
         String phone = "+595981777019";
@@ -1216,7 +1257,8 @@ class ConversationServiceImplTest {
         Employee juan = employee(3L, "Juan", "Gómez", barba);
         stubServiceLookup("Corte Barba", barba);
         stubEmployeeListing(juan);
-        when(appointmentRepository.existsOverlapping(eq(3L), any(), any(), any(), any())).thenReturn(true);
+        when(appointmentService.isAvailable(eq(1L), eq(3L), nullable(Long.class), any(Instant.class)))
+                .thenReturn(false);
 
         stubAi("Corte Barba hoy a las 09:00",
                 "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte Barba\nSTART_AT: hoy a las 09:00\nCONFIDENCE: 0.8\n"
@@ -1363,6 +1405,105 @@ class ConversationServiceImplTest {
         ConversationResponse afterReset = conversationService.processChannelConversation(1L, phone, "Sí");
         assertThat(afterReset.getAppointmentId()).isNull();
         verify(appointmentService, never()).create(any(), any());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AWAITING_CUSTOMER_NAME: Customer nunca es prerequisito para conversar ni armar el
+    // borrador; solo entra en juego al confirmar. Un mensaje solo se interpreta como nombre
+    // cuando el estado está exactamente en esta etapa, nunca por el solo hecho de que el
+    // Customer sea desconocido.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void serviceCorrectionMessageIsNeverMisreadAsCustomerNameForUnknownPhone() {
+        String phone = "+595987000098";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        stubServiceLookup("Corte", corte);
+        stubAi("Hola quiero reservar un corte",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nCONFIDENCE: 0.8\nREPLY: no importa");
+
+        ConversationResponse first = conversationService.processChannelConversation(
+                1L, phone, "Hola quiero reservar un corte");
+        assertThat(first.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+
+        // Antes de esta simplificación, este mensaje se interpretaba como el nombre del cliente
+        // (firstName="corte", lastName="+ barba") porque un booleano oculto (awaitingName) se
+        // activaba apenas se detectaba una intención de reserva en un teléfono desconocido. Ahora
+        // un mensaje solo se interpreta como nombre en ConversationStage.AWAITING_CUSTOMER_NAME.
+        stubAi("corte + barba", "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nCONFIDENCE: 0.6\nREPLY: no importa");
+        ConversationResponse second = conversationService.processChannelConversation(1L, phone, "corte + barba");
+
+        assertThat(customersByPhone).doesNotContainKey(phone);
+        assertThat(second.getReply()).doesNotContain("¿Cuál es tu nombre?");
+    }
+
+    @Test
+    void expiredAwaitingCustomerNameStageDoesNotCreateCustomerOrAppointmentFromStaleReply() {
+        String phone = "+595987000099";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+        stubAi("Quiero un corte mañana a las 14",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: mañana a las 14\n"
+                        + "CONFIDENCE: 0.9\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte mañana a las 14");
+
+        ConversationResponse afterYes = conversationService.processChannelConversation(1L, phone, "Sí");
+        assertThat(afterYes.getReply()).contains("¿Cuál es tu nombre?");
+
+        backdateState(1L, phone, Duration.ofMinutes(60));
+
+        stubAi("María López", "INTENT: UNKNOWN\nCONFIDENCE: 0.3\nREPLY: No logré entenderte, ¿podés repetirlo?");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "María López");
+
+        assertThat(customersByPhone).doesNotContainKey(phone);
+        assertThat(result.getAppointmentId()).isNull();
+        verify(appointmentService, never()).create(any(), any());
+    }
+
+    @Test
+    void confirmationIsNeverAskedTwiceForANewCustomer() {
+        String phone = "+595987000096";
+        Service corte = service(4L, "Corte", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte", corte);
+        stubEmployeeListing(juan);
+        stubAi("Quiero un corte mañana a las 14",
+                "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nSTART_AT: mañana a las 14\n"
+                        + "CONFIDENCE: 0.9\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Quiero un corte mañana a las 14");
+        conversationService.processChannelConversation(1L, phone, "Sí");
+
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(950L);
+        response.setServiceName("Corte");
+        response.setEmployeeName("Juan Gómez");
+        response.setCustomerName("María López");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
+
+        ConversationResponse afterName = conversationService.processChannelConversation(1L, phone, "María López");
+
+        assertThat(afterName.getReply()).doesNotContain("¿Confirmás?");
+        assertThat(afterName.getAppointmentId()).isEqualTo(950L);
+        verify(appointmentService, org.mockito.Mockito.times(1)).create(eq(1L), any());
+    }
+
+    @Test
+    void rescheduleIntentForUnknownCustomerRepliesWithNoAppointmentFoundInsteadOfAskingIdentity() {
+        String phone = "+595987000097";
+        stubAi("Quiero cambiar mi turno a mañana",
+                "INTENT: RESCHEDULE_APPOINTMENT\nSTART_AT: mañana a las 10\nCONFIDENCE: 0.7\nREPLY: no importa");
+
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero cambiar mi turno a mañana");
+
+        assertThat(result.getReply()).contains("No encontré ninguna reserva");
+        assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersByPhone).doesNotContainKey(phone);
+        verify(appointmentService, never()).reschedule(anyLong(), anyLong(), any());
     }
 
 }

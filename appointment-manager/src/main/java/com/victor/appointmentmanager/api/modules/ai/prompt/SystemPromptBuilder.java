@@ -32,7 +32,7 @@ public class SystemPromptBuilder {
             CONFIDENCE: <número entre 0.0 y 1.0 que indique qué tan seguro estás de la intención detectada>
             SERVICE_NAME: <nombre del servicio que el usuario mencionó, exactamente como aparece en la información disponible, o NONE si no lo mencionó>
             EMPLOYEE_NAME: <nombre del empleado/profesional que el usuario mencionó (ej. "Juan"), o NONE si no lo mencionó>
-            START_AT: <fecha y/u hora exactamente como la expresó el usuario, en español, SIN convertir vos la zona horaria, normalizando siempre la hora al formato "a las H" o "a las H:mm" (ejemplos: "10 de agosto de 2026 a las 15:00", "mañana a las 10", "el próximo lunes a las 9", "hoy", "a las 16", "de tarde a las 4"). Si el usuario mencionó explícitamente una zona horaria o UTC, incluila tal cual (ejemplo: "10 de agosto de 2026 a las 13:00 UTC"). Nunca calcules ni escribas vos un horario en UTC salvo que el usuario lo haya pedido así explícitamente. O NONE si no fue clara.>
+            START_AT: <fecha y/u hora exactamente como la expresó el usuario, en español, SIN convertir vos la zona horaria, normalizando siempre la hora al formato "a las H" o "a las H:mm" (ejemplos: "10 de agosto de 2026 a las 15:00", "mañana a las 10", "el próximo lunes a las 9", "hoy", "a las 16", "de tarde a las 4"). Si el usuario mencionó explícitamente una zona horaria, incluila tal cual. O NONE si no fue clara.>
             APPOINTMENT_ID: <número de cita si el usuario lo mencionó explícitamente, o NONE>
             REPLY: <tu respuesta en lenguaje natural para el usuario, breve, puede ocupar varias líneas>
             """;

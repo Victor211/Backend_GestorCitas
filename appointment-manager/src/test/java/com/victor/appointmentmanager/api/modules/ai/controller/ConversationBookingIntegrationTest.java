@@ -359,7 +359,9 @@ class ConversationBookingIntegrationTest {
     }
 
     // ---------------------------------------------------------------------------------------
-    // CASO A: cliente nuevo, multi-turno completo (identificación + slot-filling + confirmación)
+    // CASO A / TEST B: cliente nuevo, multi-turno completo. Customer no es prerequisito para
+    // recolectar servicio/fecha/hora: se identifica recién después de la confirmación positiva,
+    // en la etapa dedicada AWAITING_CUSTOMER_NAME, sin volver a pedir "¿Confirmás?".
     // ---------------------------------------------------------------------------------------
 
     @Test
@@ -370,21 +372,26 @@ class ConversationBookingIntegrationTest {
                 .thenReturn("INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
         String firstResponse = converse(newPhone, "Hola, quiero reservar un turno");
         JsonNode first = objectMapper.readTree(firstResponse).path("data");
-        assertThat(first.path("reply").asText()).contains("¿Cuál es tu nombre?");
-        assertThat(first.path("reply").asText().toLowerCase()).doesNotContain("teléfono");
-
-        String secondResponse = converse(newPhone, "María López");
-        JsonNode second = objectMapper.readTree(secondResponse).path("data");
-        assertThat(second.path("reply").asText().toLowerCase()).doesNotContain("teléfono");
+        // Sin servicio identificado se muestra el catálogo; nunca se pide el nombre en este punto.
+        assertThat(first.path("reply").asText()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(first.path("reply").asText()).contains("Corte");
 
         stubAiBookingReply("Quiero un corte el lunes a las 9", slotStart);
-        String thirdResponse = converse(newPhone, "Quiero un corte el lunes a las 9");
-        JsonNode third = objectMapper.readTree(thirdResponse).path("data");
-        assertThat(third.path("reply").asText()).contains("¿Confirmás?");
-        assertThat(third.path("appointmentId").isNull()).isTrue();
+        String secondResponse = converse(newPhone, "Quiero un corte el lunes a las 9");
+        JsonNode second = objectMapper.readTree(secondResponse).path("data");
+        assertThat(second.path("reply").asText()).contains("¿Confirmás?");
+        assertThat(second.path("appointmentId").isNull()).isTrue();
 
-        JsonNode confirmed = confirm(newPhone);
-        long appointmentId = confirmed.path("appointmentId").asLong();
+        JsonNode afterYes = confirm(newPhone);
+        assertThat(afterYes.path("reply").asText()).contains("¿Cuál es tu nombre?");
+        assertThat(afterYes.path("reply").asText().toLowerCase()).doesNotContain("teléfono");
+        assertThat(afterYes.path("appointmentId").isNull()).isTrue();
+
+        String nameResponse = converse(newPhone, "María López");
+        JsonNode named = objectMapper.readTree(nameResponse).path("data");
+        // El "sí" anterior sigue siendo válido: no se vuelve a preguntar "¿Confirmás?".
+        assertThat(named.path("reply").asText()).doesNotContain("¿Confirmás?");
+        long appointmentId = named.path("appointmentId").asLong();
         assertThat(appointmentId).isPositive();
 
         mockMvc.perform(get("/api/appointments?page=0&size=10")
@@ -406,7 +413,7 @@ class ConversationBookingIntegrationTest {
     // ---------------------------------------------------------------------------------------
 
     @Test
-    void unknownPhoneGreetingAndInfoQueriesNeverCreateACustomerOnlyBookingIntentDoes() throws Exception {
+    void unknownPhoneGreetingAndInfoQueriesNeverCreateACustomerOnlyConfirmedBookingDoes() throws Exception {
         String unknownPhone = customerPhone + "-desconocido";
 
         long customersBefore = customersCount();
@@ -426,11 +433,18 @@ class ConversationBookingIntegrationTest {
         assertThat(services.path("reply").asText()).doesNotContain("¿Cuál es tu nombre?");
         assertThat(customersCount()).isEqualTo(customersBefore);
 
-        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("Quiero reservar un turno")))
-                .thenReturn("INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
-        String bookingResponse = converse(unknownPhone, "Quiero reservar un turno");
-        JsonNode booking = objectMapper.readTree(bookingResponse).path("data");
-        assertThat(booking.path("reply").asText()).contains("¿Cuál es tu nombre?");
+        // Una intención de reserva tampoco identifica al Customer todavía: se recolecta
+        // servicio/fecha/hora igual que con un cliente conocido, y recién se pide el nombre
+        // después de la confirmación positiva.
+        stubAiBookingReply("Quiero un corte el lunes a las 9", slotStart);
+        String proposalResponse = converse(unknownPhone, "Quiero un corte el lunes a las 9");
+        JsonNode proposal = objectMapper.readTree(proposalResponse).path("data");
+        assertThat(proposal.path("reply").asText()).doesNotContain("¿Cuál es tu nombre?");
+        assertThat(proposal.path("reply").asText()).contains("¿Confirmás?");
+        assertThat(customersCount()).isEqualTo(customersBefore);
+
+        JsonNode afterYes = confirm(unknownPhone);
+        assertThat(afterYes.path("reply").asText()).contains("¿Cuál es tu nombre?");
         assertThat(customersCount()).isEqualTo(customersBefore);
 
         converse(unknownPhone, "María López");
@@ -524,6 +538,82 @@ class ConversationBookingIntegrationTest {
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.totalElements").value(1));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // TEST H: bug histórico. Un mensaje que corrige/amplía el servicio nunca debe interpretarse
+    // como el nombre del cliente, esté o no identificado el Customer.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void serviceCorrectionMessageIsNeverMisreadAsCustomerNameAndCustomerIsNotCreatedPrematurely() throws Exception {
+        String newPhone = customerPhone + "-bug-historico";
+
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("Hola quiero reservar un corte")))
+                .thenReturn("INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nCONFIDENCE: 0.8\nREPLY: no importa");
+        String firstResponse = converse(newPhone, "Hola quiero reservar un corte");
+        assertThat(objectMapper.readTree(firstResponse).path("data").path("reply").asText())
+                .doesNotContain("¿Cuál es tu nombre?");
+
+        long customersBefore = customersCount();
+
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("corte + barba")))
+                .thenReturn("INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte\nCONFIDENCE: 0.6\nREPLY: no importa");
+        String secondResponse = converse(newPhone, "corte + barba");
+
+        assertThat(objectMapper.readTree(secondResponse).path("data").path("reply").asText())
+                .doesNotContain("¿Cuál es tu nombre?");
+        assertThat(customersCount()).isEqualTo(customersBefore);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // TEST J: la consulta previa (propuesta) y la revalidación final (confirmación) comparten
+    // exactamente la misma fuente de verdad de disponibilidad (AppointmentService#isAvailable),
+    // así que sin ningún cambio externo entre ambos turnos nunca debe aparecer un falso "ese
+    // horario acaba de dejar de estar disponible".
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void proposalAndConfirmationAgreeOnAvailabilityWithNoExternalChange() throws Exception {
+        stubAiBookingReply("Quiero reservar un corte el lunes a las 9", slotStart);
+        String proposalResponse = converse("Quiero reservar un corte el lunes a las 9");
+        assertThat(objectMapper.readTree(proposalResponse).path("data").path("reply").asText())
+                .contains("¿Confirmás?");
+
+        JsonNode confirmed = confirm(customerPhone);
+
+        assertThat(confirmed.path("reply").asText()).doesNotContain("dejar de estar disponible");
+        assertThat(confirmed.path("appointmentId").asLong()).isPositive();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // TEST G (ampliado): /reset también limpia AWAITING_CUSTOMER_NAME, no solo
+    // AWAITING_CONFIRMATION. Un nombre tardío después del reset no debe crear Customer ni cita.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void resetDuringAwaitingCustomerNameClearsStateWithoutCreatingCustomerOrAppointment() throws Exception {
+        String newPhone = customerPhone + "-reset-nombre";
+        stubAiBookingReply("Quiero un corte el lunes a las 9", slotStart);
+        converse(newPhone, "Quiero un corte el lunes a las 9");
+
+        JsonNode afterYes = confirm(newPhone);
+        assertThat(afterYes.path("reply").asText()).contains("¿Cuál es tu nombre?");
+
+        String resetResponse = converse(newPhone, "/reset");
+        assertThat(objectMapper.readTree(resetResponse).path("data").path("reply").asText())
+                .isEqualTo("Conversación reiniciada.");
+
+        long customersBefore = customersCount();
+        when(aiProvider.generateResponse(anyString(), org.mockito.ArgumentMatchers.eq("María López")))
+                .thenReturn("INTENT: UNKNOWN\nCONFIDENCE: 0.2\nREPLY: no logré entenderte");
+        converse(newPhone, "María López");
+
+        assertThat(customersCount()).isEqualTo(customersBefore);
+        mockMvc.perform(get("/api/appointments?page=0&size=10")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalElements").value(0));
     }
 
 }

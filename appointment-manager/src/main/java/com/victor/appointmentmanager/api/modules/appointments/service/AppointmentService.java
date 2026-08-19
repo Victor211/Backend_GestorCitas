@@ -35,4 +35,17 @@ public interface AppointmentService {
 
     AppointmentResponse cancel(Long businessId, Long id);
 
+    /**
+     * Única fuente de verdad para "¿este horario está disponible?": aplica exactamente las mismas
+     * reglas (empleado-servicio, no en el pasado, horario laboral, sin solapamiento) que {@link
+     * #create(Long, CreateAppointmentRequest)} usa para revalidar antes de persistir. Pensado para
+     * consultas previas (p. ej. el flujo conversacional de WhatsApp) que necesitan comprobar
+     * disponibilidad sin llegar a crear la cita. {@code serviceId} es opcional: si es {@code null}
+     * se evalúa con una duración por defecto y sin verificar la asignación empleado-servicio, para
+     * cubrir consultas de disponibilidad genéricas ("¿Juan está libre a las 16?") donde el cliente
+     * todavía no mencionó un servicio. Nunca lanza excepción por indisponibilidad: devuelve {@code
+     * false}, incluyendo cuando el negocio/empleado/servicio no existen.
+     */
+    boolean isAvailable(Long businessId, Long employeeId, Long serviceId, Instant startAt);
+
 }

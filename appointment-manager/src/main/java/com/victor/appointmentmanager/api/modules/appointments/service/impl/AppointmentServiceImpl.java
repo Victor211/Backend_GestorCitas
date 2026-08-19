@@ -43,10 +43,18 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Optional;
 
 @org.springframework.stereotype.Service
 @RequiredArgsConstructor
 public class AppointmentServiceImpl implements AppointmentService {
+
+    /**
+     * Duración asumida para una consulta de disponibilidad que todavía no tiene un Service
+     * resuelto (ver {@link #isAvailable(Long, Long, Long, Instant)}). Nunca se usa para crear una
+     * cita real: {@link #create(Long, CreateAppointmentRequest)} siempre exige un Service válido.
+     */
+    private static final int DEFAULT_AVAILABILITY_CHECK_DURATION_MINUTES = 30;
 
     private final AppointmentRepository appointmentRepository;
     private final BusinessRepository businessRepository;
@@ -72,13 +80,8 @@ public class AppointmentServiceImpl implements AppointmentService {
         Employee employee = findOwnedEmployeeOrThrow(request.getEmployeeId(), businessId);
         Service service = findOwnedServiceOrThrow(request.getServiceId(), businessId);
 
-        assertEmployeeCanPerformService(employee, service);
-        assertNotInPast(request.getStartAt());
-
         Instant endAt = calculateEndAt(request.getStartAt(), service);
-
-        assertWithinWorkingHours(employee, business, request.getStartAt(), endAt);
-        assertNoOverlap(employee.getId(), request.getStartAt(), endAt, null);
+        assertBookable(business, employee, service, request.getStartAt(), endAt, null);
 
         Appointment appointment = appointmentMapper.toEntity(request);
         appointment.setBusiness(business);
@@ -127,12 +130,9 @@ public class AppointmentServiceImpl implements AppointmentService {
             throw new BusinessException("No se puede reprogramar una cita cancelada");
         }
 
-        assertNotInPast(request.getStartAt());
-
         Instant newEndAt = calculateEndAt(request.getStartAt(), appointment.getService());
-
-        assertWithinWorkingHours(appointment.getEmployee(), appointment.getBusiness(), request.getStartAt(), newEndAt);
-        assertNoOverlap(appointment.getEmployee().getId(), request.getStartAt(), newEndAt, appointment.getId());
+        assertBookable(appointment.getBusiness(), appointment.getEmployee(), appointment.getService(),
+                request.getStartAt(), newEndAt, appointment.getId());
 
         appointment.setStartAt(request.getStartAt());
         appointment.setEndAt(newEndAt);
@@ -170,6 +170,53 @@ public class AppointmentServiceImpl implements AppointmentService {
         }
 
         return appointmentMapper.toDto(appointment);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public boolean isAvailable(Long businessId, Long employeeId, Long serviceId, Instant startAt) {
+        Business business = findActiveBusinessOrThrow(businessId);
+        Optional<Employee> employee = employeeRepository.findByIdAndBusinessIdAndActiveTrue(employeeId, businessId);
+        if (employee.isEmpty()) {
+            return false;
+        }
+
+        Service service = null;
+        Instant endAt;
+        if (serviceId != null) {
+            Optional<Service> resolvedService = serviceRepository.findByIdAndBusinessIdAndActiveTrue(serviceId, businessId);
+            if (resolvedService.isEmpty()) {
+                return false;
+            }
+            service = resolvedService.get();
+            endAt = calculateEndAt(startAt, service);
+        } else {
+            endAt = startAt.plus(DEFAULT_AVAILABILITY_CHECK_DURATION_MINUTES, ChronoUnit.MINUTES);
+        }
+
+        try {
+            assertBookable(business, employee.get(), service, startAt, endAt, null);
+            return true;
+        } catch (BusinessException ex) {
+            return false;
+        }
+    }
+
+    /**
+     * Única implementación de "¿esta cita puede reservarse?": la usan tanto {@link
+     * #create(Long, CreateAppointmentRequest)}/{@link #reschedule(Long, Long, RescheduleAppointmentRequest)}
+     * (revalidación dura, antes de persistir) como {@link #isAvailable(Long, Long, Long, Instant)}
+     * (consulta blanda, sin persistir). {@code service} es {@code null} solo cuando la llama {@code
+     * isAvailable} sin un Service resuelto: en ese caso se omite la verificación empleado-servicio.
+     */
+    private void assertBookable(Business business, Employee employee, Service service, Instant startAt,
+                                 Instant endAt, Long excludeAppointmentId) {
+        if (service != null) {
+            assertEmployeeCanPerformService(employee, service);
+        }
+        assertNotInPast(startAt);
+        assertWithinWorkingHours(employee, business, startAt, endAt);
+        assertNoOverlap(employee.getId(), startAt, endAt, excludeAppointmentId);
     }
 
     private Appointment findByIdAndBusinessOrThrow(Long id, Long businessId) {

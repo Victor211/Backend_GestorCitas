@@ -743,6 +743,95 @@ class AppointmentServiceImplTest {
         assertThat(order.getDirection()).isEqualTo(Sort.Direction.DESC);
     }
 
+    // ---------------------------------------------------------------------------------------
+    // isAvailable(businessId, employeeId, serviceId, startAt): única fuente de verdad de
+    // disponibilidad, consultada por el flujo conversacional de WhatsApp sin crear ninguna cita.
+    // Reusa internamente los mismos checks que create()/reschedule() (assertBookable), así que
+    // consulta previa y revalidación final nunca pueden divergir.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void isAvailableReturnsTrueWhenEmployeeIsFreeWithinScheduleAndNoOverlap() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(false);
+
+        boolean available = appointmentService.isAvailable(1L, 3L, 4L, startAt);
+
+        assertThat(available).isTrue();
+    }
+
+    @Test
+    void isAvailableReturnsFalseWhenEmployeeHasOverlappingAppointment() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(true);
+
+        boolean available = appointmentService.isAvailable(1L, 3L, 4L, startAt);
+
+        assertThat(available).isFalse();
+    }
+
+    @Test
+    void isAvailableReturnsFalseWhenOutsideWorkingHours() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of());
+
+        boolean available = appointmentService.isAvailable(1L, 3L, 4L, startAt);
+
+        assertThat(available).isFalse();
+    }
+
+    @Test
+    void isAvailableReturnsFalseWhenEmployeeCannotPerformService() {
+        Service other = new Service();
+        other.setId(9L);
+        other.setName("Coloración");
+        other.setDurationMinutes(60);
+        other.setBusiness(business);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(9L, 1L)).thenReturn(Optional.of(other));
+
+        boolean available = appointmentService.isAvailable(1L, 3L, 9L, startAt);
+
+        assertThat(available).isFalse();
+    }
+
+    @Test
+    void isAvailableReturnsFalseWhenEmployeeOrServiceDoesNotExist() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(99L, 1L)).thenReturn(Optional.empty());
+
+        boolean available = appointmentService.isAvailable(1L, 99L, 4L, startAt);
+
+        assertThat(available).isFalse();
+    }
+
+    @Test
+    void isAvailableWithoutServiceIdUsesDefaultDurationAndSkipsEmployeeServiceCheck() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(false);
+
+        boolean available = appointmentService.isAvailable(1L, 3L, null, startAt);
+
+        assertThat(available).isTrue();
+        verify(serviceRepository, never()).findByIdAndBusinessIdAndActiveTrue(any(), any());
+    }
+
     private Appointment existingAppointment(AppointmentStatus status) {
         Appointment appointment = new Appointment();
         appointment.setId(100L);

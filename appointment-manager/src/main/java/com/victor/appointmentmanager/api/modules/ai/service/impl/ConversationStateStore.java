@@ -52,9 +52,11 @@ public class ConversationStateStore {
                 state.getPendingEmployeeId(), state.getPendingDate(), state.getPendingStartAt(), lastActivity);
 
         if (expired) {
-            if (state.getStage() == ConversationStage.AWAITING_CONFIRMATION) {
-                // Se resuelve en el orquestador: un "sí" contra una propuesta vencida no debe
-                // crear la cita ni tampoco procesarse en silencio como si nada hubiera pasado.
+            if (state.getStage() == ConversationStage.AWAITING_CONFIRMATION
+                    || state.getStage() == ConversationStage.AWAITING_CUSTOMER_NAME) {
+                // Se resuelve en el orquestador: un "sí" o un nombre contra una propuesta vencida
+                // no deben crear la cita ni tampoco procesarse en silencio como si nada hubiera
+                // pasado.
                 state.setExpiredPendingConfirmation(true);
             }
             state.resetForNewConversation();
