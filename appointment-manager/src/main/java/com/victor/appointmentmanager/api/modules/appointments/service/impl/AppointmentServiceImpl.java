@@ -12,6 +12,8 @@ import com.victor.appointmentmanager.api.modules.appointments.exception.Appointm
 import com.victor.appointmentmanager.api.modules.appointments.mapper.AppointmentMapper;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityCheck;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityReason;
 import com.victor.appointmentmanager.api.modules.appointments.specification.AppointmentSpecifications;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.exception.CustomerNotFoundException;
@@ -38,10 +40,12 @@ import org.springframework.web.server.ResponseStatusException;
 import java.time.DateTimeException;
 import java.time.DayOfWeek;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -55,6 +59,15 @@ public class AppointmentServiceImpl implements AppointmentService {
      * cita real: {@link #create(Long, CreateAppointmentRequest)} siempre exige un Service válido.
      */
     private static final int DEFAULT_AVAILABILITY_CHECK_DURATION_MINUTES = 30;
+
+    /**
+     * Paso entre candidatos consecutivos al generar horarios reales en {@link #findAvailableSlots}.
+     * Cada candidato igual se valida contra la duración real del Service y contra citas existentes
+     * ({@link #evaluateBookability}); este paso solo define la granularidad de los horarios que se
+     * ofrecen (ej. 10:00, 10:30, 11:00...), pensado para una lista breve en WhatsApp, no un
+     * calendario completo minuto a minuto.
+     */
+    private static final int SLOT_STEP_MINUTES = 30;
 
     private final AppointmentRepository appointmentRepository;
     private final BusinessRepository businessRepository;
@@ -175,10 +188,16 @@ public class AppointmentServiceImpl implements AppointmentService {
     @Override
     @Transactional(readOnly = true)
     public boolean isAvailable(Long businessId, Long employeeId, Long serviceId, Instant startAt) {
+        return checkAvailability(businessId, employeeId, serviceId, startAt).available();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AvailabilityCheck checkAvailability(Long businessId, Long employeeId, Long serviceId, Instant startAt) {
         Business business = findActiveBusinessOrThrow(businessId);
         Optional<Employee> employee = employeeRepository.findByIdAndBusinessIdAndActiveTrue(employeeId, businessId);
         if (employee.isEmpty()) {
-            return false;
+            return AvailabilityCheck.unavailable(AvailabilityReason.EMPLOYEE_NOT_FOUND);
         }
 
         Service service = null;
@@ -186,7 +205,7 @@ public class AppointmentServiceImpl implements AppointmentService {
         if (serviceId != null) {
             Optional<Service> resolvedService = serviceRepository.findByIdAndBusinessIdAndActiveTrue(serviceId, businessId);
             if (resolvedService.isEmpty()) {
-                return false;
+                return AvailabilityCheck.unavailable(AvailabilityReason.SERVICE_NOT_FOUND);
             }
             service = resolvedService.get();
             endAt = calculateEndAt(startAt, service);
@@ -194,29 +213,102 @@ public class AppointmentServiceImpl implements AppointmentService {
             endAt = startAt.plus(DEFAULT_AVAILABILITY_CHECK_DURATION_MINUTES, ChronoUnit.MINUTES);
         }
 
-        try {
-            assertBookable(business, employee.get(), service, startAt, endAt, null);
-            return true;
-        } catch (BusinessException ex) {
-            return false;
+        AvailabilityReason reason = evaluateBookability(business, employee.get(), service, startAt, endAt, null);
+        return reason == null ? AvailabilityCheck.AVAILABLE : AvailabilityCheck.unavailable(reason);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<Instant> findAvailableSlots(Long businessId, Long employeeId, Long serviceId, LocalDate date,
+                                             int maxSlots) {
+        if (maxSlots <= 0 || date == null) {
+            return List.of();
         }
+        Business business = findActiveBusinessOrThrow(businessId);
+        Optional<Employee> employeeOpt = employeeRepository.findByIdAndBusinessIdAndActiveTrue(employeeId, businessId);
+        Optional<Service> serviceOpt = serviceRepository.findByIdAndBusinessIdAndActiveTrue(serviceId, businessId);
+        if (employeeOpt.isEmpty() || serviceOpt.isEmpty()) {
+            return List.of();
+        }
+        Employee employee = employeeOpt.get();
+        Service service = serviceOpt.get();
+        if (!canPerformService(employee, service)) {
+            return List.of();
+        }
+
+        ZoneId zoneId = resolveZoneId(business);
+        List<Schedule> daySchedules = scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(
+                employeeId, date.getDayOfWeek());
+
+        List<Instant> slots = new ArrayList<>();
+        for (Schedule daySchedule : daySchedules) {
+            int startMinuteOfDay = daySchedule.getStartTime().toSecondOfDay() / 60;
+            int endMinuteOfDay = daySchedule.getEndTime().toSecondOfDay() / 60;
+            for (int minuteOfDay = startMinuteOfDay; minuteOfDay + service.getDurationMinutes() <= endMinuteOfDay;
+                    minuteOfDay += SLOT_STEP_MINUTES) {
+                LocalTime candidateTime = LocalTime.ofSecondOfDay(minuteOfDay * 60L);
+                Instant candidateStart = ZonedDateTime.of(date, candidateTime, zoneId).toInstant();
+                Instant candidateEnd = candidateStart.plus(service.getDurationMinutes(), ChronoUnit.MINUTES);
+                if (evaluateBookability(business, employee, service, candidateStart, candidateEnd, null) == null) {
+                    slots.add(candidateStart);
+                    if (slots.size() >= maxSlots) {
+                        return slots;
+                    }
+                }
+            }
+        }
+        return slots;
     }
 
     /**
      * Única implementación de "¿esta cita puede reservarse?": la usan tanto {@link
      * #create(Long, CreateAppointmentRequest)}/{@link #reschedule(Long, Long, RescheduleAppointmentRequest)}
-     * (revalidación dura, antes de persistir) como {@link #isAvailable(Long, Long, Long, Instant)}
-     * (consulta blanda, sin persistir). {@code service} es {@code null} solo cuando la llama {@code
-     * isAvailable} sin un Service resuelto: en ese caso se omite la verificación empleado-servicio.
+     * (revalidación dura, antes de persistir) como {@link #checkAvailability} / {@link
+     * #findAvailableSlots} (consultas blandas, sin persistir). {@code service} es {@code null} solo
+     * cuando la llama {@code checkAvailability} sin un Service resuelto: en ese caso se omite la
+     * verificación empleado-servicio.
      */
     private void assertBookable(Business business, Employee employee, Service service, Instant startAt,
                                  Instant endAt, Long excludeAppointmentId) {
-        if (service != null) {
-            assertEmployeeCanPerformService(employee, service);
+        AvailabilityReason reason = evaluateBookability(business, employee, service, startAt, endAt, excludeAppointmentId);
+        if (reason != null) {
+            throw new BusinessException(messageForReason(reason));
         }
-        assertNotInPast(startAt);
-        assertWithinWorkingHours(employee, business, startAt, endAt);
-        assertNoOverlap(employee.getId(), startAt, endAt, excludeAppointmentId);
+    }
+
+    /**
+     * Evalúa, en el mismo orden que antes lanzaba excepciones {@code assertBookable}, cuál es el
+     * primer motivo por el que un horario no puede reservarse ({@code null} si puede). Única fuente
+     * de verdad de las reglas de disponibilidad: tanto la revalidación dura (que la envuelve en una
+     * excepción) como las consultas blandas ({@code checkAvailability}, {@code findAvailableSlots})
+     * pasan por acá.
+     */
+    private AvailabilityReason evaluateBookability(Business business, Employee employee, Service service,
+                                                     Instant startAt, Instant endAt, Long excludeAppointmentId) {
+        if (service != null && !canPerformService(employee, service)) {
+            return AvailabilityReason.EMPLOYEE_CANNOT_PERFORM_SERVICE;
+        }
+        if (startAt.isBefore(Instant.now())) {
+            return AvailabilityReason.IN_PAST;
+        }
+        if (!fitsWithinWorkingHours(employee, business, startAt, endAt)) {
+            return AvailabilityReason.OUTSIDE_SCHEDULE;
+        }
+        if (appointmentRepository.existsOverlapping(employee.getId(), startAt, endAt, excludeAppointmentId,
+                AppointmentStatus.CANCELLED)) {
+            return AvailabilityReason.OVERLAPPING;
+        }
+        return null;
+    }
+
+    private String messageForReason(AvailabilityReason reason) {
+        return switch (reason) {
+            case EMPLOYEE_CANNOT_PERFORM_SERVICE -> "El empleado no está habilitado para realizar este servicio";
+            case IN_PAST -> "La fecha de la cita no puede estar en el pasado";
+            case OUTSIDE_SCHEDULE -> "La cita está fuera del horario laboral del empleado";
+            case OVERLAPPING -> "La cita se superpone con otra cita existente del empleado";
+            case EMPLOYEE_NOT_FOUND, SERVICE_NOT_FOUND -> "No se pudo validar la disponibilidad solicitada";
+        };
     }
 
     private Appointment findByIdAndBusinessOrThrow(Long id, Long businessId) {
@@ -244,25 +336,16 @@ public class AppointmentServiceImpl implements AppointmentService {
                 .orElseThrow(() -> new ResourceNotFoundException("Servicio no encontrado con id " + serviceId));
     }
 
-    private void assertEmployeeCanPerformService(Employee employee, Service service) {
-        boolean canPerform = employee.getServices().stream()
+    private boolean canPerformService(Employee employee, Service service) {
+        return employee.getServices().stream()
                 .anyMatch(assignedService -> assignedService.getId().equals(service.getId()));
-        if (!canPerform) {
-            throw new BusinessException("El empleado no está habilitado para realizar este servicio");
-        }
-    }
-
-    private void assertNotInPast(Instant startAt) {
-        if (startAt.isBefore(Instant.now())) {
-            throw new BusinessException("La fecha de la cita no puede estar en el pasado");
-        }
     }
 
     private Instant calculateEndAt(Instant startAt, Service service) {
         return startAt.plus(service.getDurationMinutes(), ChronoUnit.MINUTES);
     }
 
-    private void assertWithinWorkingHours(Employee employee, Business business, Instant startAt, Instant endAt) {
+    private boolean fitsWithinWorkingHours(Employee employee, Business business, Instant startAt, Instant endAt) {
         ZoneId zoneId = resolveZoneId(business);
 
         ZonedDateTime localStart = startAt.atZone(zoneId);
@@ -275,13 +358,9 @@ public class AppointmentServiceImpl implements AppointmentService {
         List<Schedule> daySchedules = scheduleRepository
                 .findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(employee.getId(), dayOfWeek);
 
-        boolean fitsWithinSingleSchedule = daySchedules.stream()
+        return daySchedules.stream()
                 .anyMatch(schedule -> !localStartTime.isBefore(schedule.getStartTime())
                         && !localEndTime.isAfter(schedule.getEndTime()));
-
-        if (!fitsWithinSingleSchedule) {
-            throw new BusinessException("La cita está fuera del horario laboral del empleado");
-        }
     }
 
     private ZoneId resolveZoneId(Business business) {
@@ -289,14 +368,6 @@ public class AppointmentServiceImpl implements AppointmentService {
             return ZoneId.of(business.getTimezone());
         } catch (DateTimeException ex) {
             throw new BusinessException("La zona horaria configurada en el negocio no es válida");
-        }
-    }
-
-    private void assertNoOverlap(Long employeeId, Instant startAt, Instant endAt, Long excludeId) {
-        boolean overlaps = appointmentRepository.existsOverlapping(
-                employeeId, startAt, endAt, excludeId, AppointmentStatus.CANCELLED);
-        if (overlaps) {
-            throw new BusinessException("La cita se superpone con otra cita existente del empleado");
         }
     }
 

@@ -11,6 +11,8 @@ import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentS
 import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotFoundException;
 import com.victor.appointmentmanager.api.modules.appointments.mapper.AppointmentMapper;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityCheck;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityReason;
 import com.victor.appointmentmanager.api.modules.appointments.specification.AppointmentSpecifications;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.exception.CustomerNotFoundException;
@@ -830,6 +832,214 @@ class AppointmentServiceImplTest {
 
         assertThat(available).isTrue();
         verify(serviceRepository, never()).findByIdAndBusinessIdAndActiveTrue(any(), any());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // checkAvailability(businessId, employeeId, serviceId, startAt): misma evaluación que
+    // isAvailable, pero exponiendo el motivo exacto (AvailabilityReason) para que el flujo
+    // conversacional pueda redactar mensajes específicos en vez de uno genérico.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void checkAvailabilityReturnsAvailableWhenFreeWithinScheduleAndNoOverlap() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(false);
+
+        AvailabilityCheck result = appointmentService.checkAvailability(1L, 3L, 4L, startAt);
+
+        assertThat(result.available()).isTrue();
+        assertThat(result.reason()).isNull();
+    }
+
+    @Test
+    void checkAvailabilityReportsOverlappingReasonWhenEmployeeHasAnotherAppointment() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(true);
+
+        AvailabilityCheck result = appointmentService.checkAvailability(1L, 3L, 4L, startAt);
+
+        assertThat(result.available()).isFalse();
+        assertThat(result.reason()).isEqualTo(AvailabilityReason.OVERLAPPING);
+    }
+
+    @Test
+    void checkAvailabilityReportsOutsideScheduleReasonWhenEmployeeHasNoScheduleThatDay() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of());
+
+        AvailabilityCheck result = appointmentService.checkAvailability(1L, 3L, 4L, startAt);
+
+        assertThat(result.available()).isFalse();
+        assertThat(result.reason()).isEqualTo(AvailabilityReason.OUTSIDE_SCHEDULE);
+    }
+
+    @Test
+    void checkAvailabilityReportsCannotPerformServiceReasonWhenEmployeeIsNotEnabledForService() {
+        Service other = new Service();
+        other.setId(9L);
+        other.setName("Coloración");
+        other.setDurationMinutes(60);
+        other.setBusiness(business);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(9L, 1L)).thenReturn(Optional.of(other));
+
+        AvailabilityCheck result = appointmentService.checkAvailability(1L, 3L, 9L, startAt);
+
+        assertThat(result.available()).isFalse();
+        assertThat(result.reason()).isEqualTo(AvailabilityReason.EMPLOYEE_CANNOT_PERFORM_SERVICE);
+    }
+
+    @Test
+    void checkAvailabilityReportsEmployeeNotFoundReasonWhenEmployeeDoesNotExist() {
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(99L, 1L)).thenReturn(Optional.empty());
+
+        AvailabilityCheck result = appointmentService.checkAvailability(1L, 99L, 4L, startAt);
+
+        assertThat(result.available()).isFalse();
+        assertThat(result.reason()).isEqualTo(AvailabilityReason.EMPLOYEE_NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // findAvailableSlots(businessId, employeeId, serviceId, date, maxSlots): horarios REALES
+    // (Schedule menos Appointments existentes, respetando la duración del Service), la misma
+    // fuente de verdad que checkAvailability para cada candidato. Nunca deriva horarios del
+    // Schedule bruto: cada candidato se valida individualmente.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void findAvailableSlotsReturnsEveryFreeStartTimeWithinScheduleStep() {
+        LocalDate futureMonday = LocalDate.now(ZONE).with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(false);
+
+        List<Instant> slots = appointmentService.findAvailableSlots(1L, 3L, 4L, futureMonday, 10);
+
+        // Schedule 08:00-12:00, Service de 30 minutos, paso de 30 minutos: 08:00, 08:30, ..., 11:30.
+        List<LocalTime> expectedTimes = List.of(LocalTime.of(8, 0), LocalTime.of(8, 30), LocalTime.of(9, 0),
+                LocalTime.of(9, 30), LocalTime.of(10, 0), LocalTime.of(10, 30), LocalTime.of(11, 0),
+                LocalTime.of(11, 30));
+        List<LocalTime> actualTimes = slots.stream().map(instant -> instant.atZone(ZONE).toLocalTime()).toList();
+        assertThat(actualTimes).isEqualTo(expectedTimes);
+    }
+
+    @Test
+    void findAvailableSlotsExcludesSlotOccupiedByExistingAppointment() {
+        LocalDate futureMonday = LocalDate.now(ZONE).with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+        Instant occupiedStart = ZonedDateTime.of(futureMonday, LocalTime.of(9, 0), ZONE).toInstant();
+        Instant occupiedEnd = occupiedStart.plusSeconds(30 * 60);
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(false);
+        when(appointmentRepository.existsOverlapping(3L, occupiedStart, occupiedEnd, null, AppointmentStatus.CANCELLED))
+                .thenReturn(true);
+
+        List<Instant> slots = appointmentService.findAvailableSlots(1L, 3L, 4L, futureMonday, 10);
+
+        assertThat(slots).doesNotContain(occupiedStart);
+        assertThat(slots).contains(
+                ZonedDateTime.of(futureMonday, LocalTime.of(8, 0), ZONE).toInstant(),
+                ZonedDateTime.of(futureMonday, LocalTime.of(9, 30), ZONE).toInstant());
+    }
+
+    @Test
+    void findAvailableSlotsRespectsRealServiceDurationNotDefaultThirtyMinutes() {
+        Service longService = new Service();
+        longService.setId(11L);
+        longService.setName("Coloración");
+        longService.setDurationMinutes(90);
+        longService.setBusiness(business);
+        employee.setServices(Set.of(longService));
+
+        LocalDate futureMonday = LocalDate.now(ZONE).with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(11L, 1L)).thenReturn(Optional.of(longService));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(false);
+
+        List<Instant> slots = appointmentService.findAvailableSlots(1L, 3L, 11L, futureMonday, 10);
+
+        // Schedule 08:00-12:00 (240 min), Service de 90 minutos, paso de 30: 08:00, 08:30, 09:00
+        // (09:00+90=10:30, cabe); 09:30+90=11:00 cabe; 10:30+90=12:00 cabe (límite exacto);
+        // 11:00+90=12:30 NO cabe. Última hora válida: 10:30.
+        List<LocalTime> actualTimes = slots.stream().map(instant -> instant.atZone(ZONE).toLocalTime()).toList();
+        assertThat(actualTimes).contains(LocalTime.of(10, 30));
+        assertThat(actualTimes).doesNotContain(LocalTime.of(11, 0));
+    }
+
+    @Test
+    void findAvailableSlotsReturnsEmptyWhenEmployeeCannotPerformService() {
+        Service other = new Service();
+        other.setId(9L);
+        other.setName("Coloración");
+        other.setDurationMinutes(60);
+        other.setBusiness(business);
+
+        LocalDate futureMonday = LocalDate.now(ZONE).with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(9L, 1L)).thenReturn(Optional.of(other));
+
+        List<Instant> slots = appointmentService.findAvailableSlots(1L, 3L, 9L, futureMonday, 10);
+
+        assertThat(slots).isEmpty();
+    }
+
+    @Test
+    void findAvailableSlotsReturnsEmptyWhenEmployeeHasNoScheduleThatDay() {
+        LocalDate futureMonday = LocalDate.now(ZONE).with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of());
+
+        List<Instant> slots = appointmentService.findAvailableSlots(1L, 3L, 4L, futureMonday, 10);
+
+        assertThat(slots).isEmpty();
+    }
+
+    @Test
+    void findAvailableSlotsNeverReturnsMoreThanRequestedMax() {
+        LocalDate futureMonday = LocalDate.now(ZONE).with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+
+        when(businessRepository.findByIdAndActiveTrue(1L)).thenReturn(Optional.of(business));
+        when(employeeRepository.findByIdAndBusinessIdAndActiveTrue(3L, 1L)).thenReturn(Optional.of(employee));
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(4L, 1L)).thenReturn(Optional.of(service));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(any(), any(), any(), any(), any())).thenReturn(false);
+
+        List<Instant> slots = appointmentService.findAvailableSlots(1L, 3L, 4L, futureMonday, 3);
+
+        assertThat(slots).hasSize(3);
     }
 
     private Appointment existingAppointment(AppointmentStatus status) {

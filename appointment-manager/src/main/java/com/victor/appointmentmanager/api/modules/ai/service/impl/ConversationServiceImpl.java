@@ -23,6 +23,7 @@ import com.victor.appointmentmanager.api.modules.appointments.entity.Appointment
 import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentStatus;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityReason;
 import com.victor.appointmentmanager.api.modules.appointments.specification.AppointmentSpecifications;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
@@ -46,7 +47,9 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -83,8 +86,14 @@ public class ConversationServiceImpl implements ConversationService {
     private static final String ASK_TIME_REPLY = "¿A qué hora te gustaría?";
     private static final String SERVICE_NOT_FOUND_REPLY =
             "No encontré ese servicio en nuestro catálogo. ¿Podés confirmarme el nombre exacto?";
-    private static final String EMPLOYEE_NOT_AVAILABLE_REPLY =
-            "En este momento no tenemos un profesional disponible para ese servicio.";
+    /**
+     * Nombre de profesional mencionado por el cliente que no coincide con ningún Employee activo
+     * del negocio (no confundir con "existe pero no está libre a esa hora/no realiza el servicio":
+     * esos casos usan {@link ConversationReplyFormatter#formatUnavailableReason}, que sí conoce la
+     * causa real).
+     */
+    private static final String EMPLOYEE_NOT_FOUND_REPLY =
+            "No encontré a ese profesional en nuestro equipo. ¿Podés confirmarme el nombre?";
     private static final String BOOKING_FAILED_REPLY =
             "No pudimos completar la reserva en este momento. ¿Querés intentar con otro horario?";
     private static final String SLOT_NO_LONGER_AVAILABLE_REPLY =
@@ -104,6 +113,17 @@ public class ConversationServiceImpl implements ConversationService {
 
     private static final double CONFIRMED_BOOKING_CONFIDENCE = 1.0;
     private static final double DETERMINISTIC_CONFIDENCE = 1.0;
+
+    /** Cuántos días hacia adelante se recorren para armar una lista de disponibilidad sin fecha fija. */
+    private static final int MAX_AVAILABILITY_DAYS_LOOKAHEAD = 7;
+    /**
+     * Cuántos horarios reales se le piden como máximo a AppointmentService por profesional/día. NO
+     * es el tope de presentación (eso vive en ConversationReplyFormatter#MAX_SLOTS_PER_PERIOD, que
+     * recorta por franja Mañana/Tarde): este valor solo evita traer una cantidad desmedida de
+     * horarios de un día con jornada muy extensa, sin cortar arbitrariamente antes de llegar a la
+     * tarde (antes era 5, lo que en la práctica truncaba casi siempre en horarios de la mañana).
+     */
+    private static final int MAX_AVAILABILITY_SLOTS_PER_EMPLOYEE = 20;
 
     /**
      * Expresión de hora "pelada" (sin fecha), opcionalmente con un marcador de tarde/mañana/noche.
@@ -532,9 +552,21 @@ public class ConversationServiceImpl implements ConversationService {
                 if (available) {
                     return null;
                 }
+                // isAvailable ya confirmó que no puede reservarse; una segunda consulta (misma
+                // fuente de verdad, checkAvailability) trae el motivo exacto para no colapsar
+                // "ocupado"/"fuera de horario"/"no realiza el servicio" en un único mensaje genérico.
+                AvailabilityReason reason = appointmentService.checkAvailability(business.getId(), chosen.get().getId(),
+                        state.getPendingServiceId(), state.getPendingStartAt()).reason();
+                String reply = describeUnavailability(business, chosen.get(), state.getPendingServiceId(),
+                        reason, state.getPendingStartAt());
                 state.setPendingStartAt(null);
                 state.setPendingDate(null);
-                return DispatchOutcome.reply(replyFormatter.employeeNotAvailableAtRequestedTime(chosen.get()));
+                if (reason == AvailabilityReason.EMPLOYEE_CANNOT_PERFORM_SERVICE) {
+                    // Un profesional explícito que no realiza el servicio no puede quedar "pegado":
+                    // hay que volver a resolverlo (o preguntar) para el nuevo intento.
+                    state.setPendingEmployeeId(null);
+                }
+                return DispatchOutcome.reply(reply);
             }
             // El empleado guardado ya no existe/está activo: se resuelve de nuevo abajo.
             state.setPendingEmployeeId(null);
@@ -556,6 +588,22 @@ public class ConversationServiceImpl implements ConversationService {
         state.setPendingEmployeeId(onlyCandidate.getId());
         rememberEmployee(state, onlyCandidate);
         return null;
+    }
+
+    /**
+     * Redacta el motivo específico por el que un profesional puntual no está disponible. {@code
+     * reason} puede llegar {@code null} en la ventana (extremadamente improbable) entre la consulta
+     * boolean y la de motivo detallado; se trata igual que OVERLAPPING (el motivo más común) para
+     * no romper el flujo con un mensaje vacío.
+     */
+    private String describeUnavailability(Business business, Employee employee, Long serviceId,
+                                           AvailabilityReason reason, Instant startAt) {
+        Service service = serviceId != null
+                ? serviceRepository.findByIdAndBusinessIdAndActiveTrue(serviceId, business.getId()).orElse(null)
+                : null;
+        ZonedDateTime localStart = startAt.atZone(ZoneId.of(business.getTimezone()));
+        AvailabilityReason resolvedReason = reason != null ? reason : AvailabilityReason.OVERLAPPING;
+        return replyFormatter.formatUnavailableReason(employee, service, resolvedReason, localStart);
     }
 
     /** Empleados activos, habilitados para el servicio, y realmente libres en ese horario. */
@@ -583,12 +631,16 @@ public class ConversationServiceImpl implements ConversationService {
     }
 
     private List<Employee> employeesForService(Long businessId, Long serviceId) {
-        return employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        businessId, "", Pageable.unpaged())
-                .getContent().stream()
+        return activeEmployees(businessId).stream()
                 .filter(employee -> employee.getServices().stream()
                         .anyMatch(assigned -> assigned.getId().equals(serviceId)))
                 .toList();
+    }
+
+    private List<Employee> activeEmployees(Long businessId) {
+        return employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
+                        businessId, "", Pageable.unpaged())
+                .getContent();
     }
 
     private boolean employeeCanPerformService(Long businessId, Long employeeId, Long serviceId) {
@@ -627,7 +679,7 @@ public class ConversationServiceImpl implements ConversationService {
         if (parsed.employeeName() != null) {
             Optional<Employee> employee = findEmployeeByName(business.getId(), parsed.employeeName());
             if (employee.isEmpty()) {
-                return EMPLOYEE_NOT_AVAILABLE_REPLY;
+                return EMPLOYEE_NOT_FOUND_REPLY;
             }
             state.setPendingEmployeeId(employee.get().getId());
             rememberEmployee(state, employee.get());
@@ -753,6 +805,14 @@ public class ConversationServiceImpl implements ConversationService {
                     parsed.confidence(), null);
         }
 
+        // Consulta genérica ("¿qué horarios tienen disponibles?", "¿para cuándo tienen lugar?"):
+        // el servicio ya se conoce pero todavía no hay un horario puntual que validar. En vez de
+        // caer en el texto libre de la IA (que solo tiene el Schedule bruto como contexto, nunca
+        // Appointments existentes: ver AJUSTE 1/2/3), se arma una lista real de horarios libres.
+        if (state.getPendingStartAt() == null && state.hasPendingService()) {
+            return respondWithAvailabilityList(business, state, parsed);
+        }
+
         if (state.getPendingStartAt() != null && !state.hasPendingEmployee() && state.hasPendingService()) {
             List<Employee> available = resolveAvailableEmployees(business, state.getPendingServiceId(),
                     state.getPendingStartAt());
@@ -784,6 +844,66 @@ public class ConversationServiceImpl implements ConversationService {
         String reply = replyFormatter.availabilityAnswer(employee.get(), available, localStart, serviceName);
 
         return finish(state, business, reply, ConversationIntent.CHECK_AVAILABILITY, parsed.confidence(), null);
+    }
+
+    /**
+     * Arma una lista de horarios REALMENTE libres (Schedule menos Appointments existentes,
+     * respetando la duración real del Service) para el servicio ya conocido del borrador. Nunca
+     * delega esta cuenta a la IA ni a un volcado del Schedule: cada candidato pasa por {@link
+     * AppointmentService#findAvailableSlots}, la misma fuente de verdad que valida la reserva
+     * final. Si el cliente ya mencionó un profesional explícito, la lista se acota a ese único
+     * profesional (no se le ofrecen horarios de otro sin que lo haya pedido); si no, se listan
+     * todos los que realizan el servicio. Si ya hay una fecha conocida (el cliente dijo "el
+     * jueves" pero no la hora), se busca solo ese día; si no hay fecha, se recorren los próximos
+     * días hasta juntar un puñado de opciones por profesional.
+     */
+    private ConversationResponse respondWithAvailabilityList(Business business, ConversationState state,
+                                                               ParsedAiReply parsed) {
+        Optional<Service> service = serviceRepository.findByIdAndBusinessIdAndActiveTrue(
+                state.getPendingServiceId(), business.getId());
+        if (service.isEmpty()) {
+            return finish(state, business, SERVICE_NOT_FOUND_REPLY, ConversationIntent.CHECK_AVAILABILITY,
+                    parsed.confidence(), null);
+        }
+
+        List<Employee> candidates = state.hasPendingEmployee()
+                ? employeeRepository.findByIdAndBusinessIdAndActiveTrue(state.getPendingEmployeeId(), business.getId())
+                        .map(List::of).orElse(List.of())
+                : employeesForService(business.getId(), state.getPendingServiceId());
+
+        boolean singleDayOnly = state.getPendingDate() != null;
+        LocalDate startDate = singleDayOnly
+                ? state.getPendingDate()
+                : ZonedDateTime.now(ZoneId.of(business.getTimezone())).toLocalDate();
+
+        Map<Employee, List<Instant>> slotsByEmployee = new LinkedHashMap<>();
+        for (Employee employee : candidates) {
+            List<Instant> slots = singleDayOnly
+                    ? appointmentService.findAvailableSlots(business.getId(), employee.getId(),
+                            state.getPendingServiceId(), startDate, MAX_AVAILABILITY_SLOTS_PER_EMPLOYEE)
+                    : collectUpcomingSlots(business, employee, state.getPendingServiceId(), startDate);
+            slotsByEmployee.put(employee, slots);
+        }
+
+        String reply = candidates.size() <= 1
+                ? replyFormatter.formatAvailabilityList(business, service.get(),
+                        slotsByEmployee.values().stream().findFirst().orElse(List.of()))
+                : replyFormatter.formatEmployeeAvailability(business, service.get(), slotsByEmployee);
+
+        return finish(state, business, reply, ConversationIntent.CHECK_AVAILABILITY, parsed.confidence(), null);
+    }
+
+    /** Recorre los próximos días (hasta MAX_AVAILABILITY_DAYS_LOOKAHEAD) juntando horarios reales hasta el tope. */
+    private List<Instant> collectUpcomingSlots(Business business, Employee employee, Long serviceId, LocalDate fromDate) {
+        List<Instant> slots = new ArrayList<>();
+        LocalDate date = fromDate;
+        for (int day = 0; day < MAX_AVAILABILITY_DAYS_LOOKAHEAD && slots.size() < MAX_AVAILABILITY_SLOTS_PER_EMPLOYEE; day++) {
+            List<Instant> daySlots = appointmentService.findAvailableSlots(business.getId(), employee.getId(),
+                    serviceId, date, MAX_AVAILABILITY_SLOTS_PER_EMPLOYEE - slots.size());
+            slots.addAll(daySlots);
+            date = date.plusDays(1);
+        }
+        return slots;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -892,12 +1012,39 @@ public class ConversationServiceImpl implements ConversationService {
                 .findFirst();
     }
 
+    /**
+     * Resuelve el nombre de profesional extraído por la IA contra los Employee activos del
+     * negocio. Se busca por coincidencia (normalizada: minúsculas, sin acentos) del NOMBRE
+     * COMPLETO, no solo del firstName: la IA puede extraer "Juan" o "Juan Gómez" según lo que haya
+     * dicho el cliente, y el nombre completo de un empleado con apellido nunca "empieza por" un
+     * firstName-only-contains si el cliente dio el apellido también, así que se compara el nombre
+     * completo normalizado en ambas direcciones. Antes se buscaba solo por firstName (ver
+     * EmployeeRepository#findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue), lo que
+     * hacía fallar cualquier búsqueda que incluyera el apellido (ej. "Juan Gómez") y colapsaba en
+     * EMPLOYEE_NOT_FOUND_REPLY aunque el profesional sí existiera y sí tuviera horario ese día.
+     */
     private Optional<Employee> findEmployeeByName(Long businessId, String employeeName) {
-        return employeeRepository.findByBusinessIdAndFirstNameContainingIgnoreCaseAndActiveTrue(
-                        businessId, employeeName, PageRequest.of(0, 1))
-                .getContent()
-                .stream()
+        String normalizedQuery = normalizeForNameMatch(employeeName);
+        if (normalizedQuery.isEmpty()) {
+            return Optional.empty();
+        }
+        return activeEmployees(businessId).stream()
+                .filter(candidate -> matchesEmployeeName(candidate, normalizedQuery))
                 .findFirst();
+    }
+
+    private boolean matchesEmployeeName(Employee employee, String normalizedQuery) {
+        String normalizedFull = normalizeForNameMatch(employee.getFirstName() + " " + employee.getLastName());
+        String normalizedFirst = normalizeForNameMatch(employee.getFirstName());
+        return normalizedFull.contains(normalizedQuery) || normalizedQuery.contains(normalizedFirst);
+    }
+
+    private String normalizeForNameMatch(String value) {
+        String lower = value.trim().toLowerCase(Locale.ROOT);
+        return java.text.Normalizer.normalize(lower, java.text.Normalizer.Form.NFD)
+                .replaceAll("\\p{M}", "")
+                .replaceAll("\\s+", " ")
+                .trim();
     }
 
     private List<Service> activeServices(Long businessId) {

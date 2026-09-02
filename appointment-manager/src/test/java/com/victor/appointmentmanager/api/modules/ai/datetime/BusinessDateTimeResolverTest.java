@@ -91,6 +91,35 @@ class BusinessDateTimeResolverTest {
         assertThat(local.toLocalTime()).isEqualTo(LocalTime.of(10, 0));
     }
 
+    // AJUSTE 11: "jueves"/"el jueves" pelado (sin "próximo"/"este") también debe resolverse a una
+    // fecha concreta usando Business.timezone, no quedar como texto ambiguo. Antes solo se
+    // reconocían "próximo X"/"este X"; un nombre de día suelto caía directo al parser de fecha
+    // absoluta y fallaba con BusinessException.
+    @Test
+    void resolvesBareWeekdayNameWithoutProximoOrEstePrefix() {
+        ZoneId zone = ZoneId.of(ASUNCION);
+        LocalDate expectedDate = ZonedDateTime.now(zone).toLocalDate().with(TemporalAdjusters.nextOrSame(DayOfWeek.THURSDAY));
+
+        Instant resolved = resolver.resolve("jueves a las 10", ASUNCION);
+
+        ZonedDateTime local = resolved.atZone(zone);
+        assertThat(local.toLocalDate()).isEqualTo(expectedDate);
+        assertThat(local.getDayOfWeek()).isEqualTo(DayOfWeek.THURSDAY);
+        assertThat(local.toLocalTime()).isEqualTo(LocalTime.of(10, 0));
+    }
+
+    @Test
+    void resolvesBareWeekdayNameWithElPrefix() {
+        ZoneId zone = ZoneId.of(ASUNCION);
+        LocalDate expectedDate = ZonedDateTime.now(zone).toLocalDate().with(TemporalAdjusters.nextOrSame(DayOfWeek.THURSDAY));
+
+        Instant resolved = resolver.resolve("el jueves a las 10:00", ASUNCION);
+
+        ZonedDateTime local = resolved.atZone(zone);
+        assertThat(local.toLocalDate()).isEqualTo(expectedDate);
+        assertThat(local.toLocalTime()).isEqualTo(LocalTime.of(10, 0));
+    }
+
     @Test
     void throwsControlledErrorForInvalidBusinessTimezone() {
         assertThatThrownBy(() -> resolver.resolve("10 de agosto de 2026 a las 15:00", "Not/AValidZone"))

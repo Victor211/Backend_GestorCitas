@@ -67,6 +67,14 @@ public class BusinessDateTimeResolver {
     private static final Pattern NEXT_WEEKDAY_PREFIX =
             Pattern.compile("(?i)^(?:el\\s+)?pr[oó]ximo\\s+(\\p{L}+)(?:\\s+|$)");
     private static final Pattern THIS_WEEKDAY_PREFIX = Pattern.compile("(?i)^este\\s+(\\p{L}+)(?:\\s+|$)");
+    /**
+     * Nombre de día "pelado", sin "próximo"/"este" (ej. "jueves a las 10", "el jueves"). Se
+     * distingue de un día real chequeando el grupo capturado contra {@link #WEEKDAYS}: cualquier
+     * otra primera palabra (ej. "a las 10") simplemente no matchea ningún día y sigue su curso
+     * normal. Semántica igual a "este" ({@link TemporalAdjusters#nextOrSame}): "jueves" se entiende
+     * como el próximo jueves que llega, incluyendo hoy si hoy es jueves.
+     */
+    private static final Pattern BARE_WEEKDAY_PREFIX = Pattern.compile("(?i)^(?:el\\s+)?(\\p{L}+)(?:\\s+|$)");
     private static final Pattern BARE_TIME_EXPRESSION = Pattern.compile(
             "(?i)^(?:(?:de|por|esta)\\s+(?:la\\s+)?(?:tarde|mañana|noche)\\s+)?a las\\s+\\d{1,2}(?::\\d{2})?$");
 
@@ -176,6 +184,15 @@ public class BusinessDateTimeResolver {
             DayOfWeek dayOfWeek = resolveDayOfWeek(thisWeekday.group(1));
             LocalDate date = today.with(TemporalAdjusters.nextOrSame(dayOfWeek));
             return combineDateAndTime(expression, date, businessZone);
+        }
+
+        Matcher bareWeekday = BARE_WEEKDAY_PREFIX.matcher(expression);
+        if (bareWeekday.find()) {
+            DayOfWeek dayOfWeek = WEEKDAYS.get(bareWeekday.group(1).toLowerCase(Locale.ROOT));
+            if (dayOfWeek != null) {
+                LocalDate date = today.with(TemporalAdjusters.nextOrSame(dayOfWeek));
+                return combineDateAndTime(expression, date, businessZone);
+            }
         }
 
         if (BARE_TIME_EXPRESSION.matcher(expression.trim()).matches()) {

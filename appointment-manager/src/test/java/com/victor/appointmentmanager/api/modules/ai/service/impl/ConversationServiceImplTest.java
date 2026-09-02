@@ -16,6 +16,8 @@ import com.victor.appointmentmanager.api.modules.appointments.dto.request.Create
 import com.victor.appointmentmanager.api.modules.appointments.dto.response.AppointmentResponse;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityCheck;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityReason;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.customers.repository.CustomerRepository;
 import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
@@ -42,7 +44,10 @@ import java.math.BigDecimal;
 import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -52,9 +57,11 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -137,6 +144,15 @@ class ConversationServiceImplTest {
         // para el businessId/employeeId que corresponda.
         lenient().when(appointmentService.isAvailable(anyLong(), anyLong(), nullable(Long.class), any(Instant.class)))
                 .thenReturn(true);
+        // Mismo default "disponible" para la variante con motivo detallado (AJUSTE 6/7): los tests
+        // que necesiten un motivo específico (ocupado, fuera de horario, no realiza el servicio) lo
+        // sobreescriben explícitamente.
+        lenient().when(appointmentService.checkAvailability(anyLong(), anyLong(), nullable(Long.class), any(Instant.class)))
+                .thenReturn(AvailabilityCheck.AVAILABLE);
+        // Sin horarios reales por defecto: los tests de listado de disponibilidad (AJUSTE 1/8/9)
+        // stubean explícitamente los slots esperados.
+        lenient().when(appointmentService.findAvailableSlots(anyLong(), anyLong(), anyLong(), any(LocalDate.class), anyInt()))
+                .thenReturn(List.of());
 
         lenient().when(conversationStateRepository.findByBusinessIdAndCustomerPhone(anyLong(), anyString()))
                 .thenAnswer(inv -> Optional.ofNullable(statesByKey.get(key(inv.getArgument(0), inv.getArgument(1)))));
@@ -1644,6 +1660,277 @@ class ConversationServiceImplTest {
         assertThat(result.getReply()).doesNotContain("¿Cuál es tu nombre?");
         assertThat(customersByPhone).doesNotContainKey(phone);
         verify(appointmentService, never()).reschedule(anyLong(), anyLong(), any());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AJUSTE 1-15: disponibilidad real en lista + interpretación correcta de día/hora/profesional
+    // ---------------------------------------------------------------------------------------
+
+    private static final ZoneId ASUNCION = ZoneId.of("America/Asuncion");
+
+    private void selectCortePremiumOnly(String phone) {
+        stubAi("Corte Premium", "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte Premium\nCONFIDENCE: 0.9\n"
+                + "REPLY: no importa");
+        ConversationResponse afterService = conversationService.processChannelConversation(1L, phone, "Corte Premium");
+        assertThat(afterService.getReply()).contains("¿Para cuándo te gustaría el turno?");
+    }
+
+    // TEST 1/2/4: servicio ya conocido + "¿qué horarios tienen disponibles?" no vuelve a listar
+    // servicios, responde en formato lista, y la lista viene de horarios reales (findAvailableSlots),
+    // nunca de un volcado del Schedule bruto.
+    @Test
+    void checkAvailabilityListWithKnownServiceDoesNotRelistServicesAndUsesRealSlots() {
+        String phone = "+595981900001";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan);
+        selectCortePremiumOnly(phone);
+
+        LocalDate today = LocalDate.now(ASUNCION);
+        Instant slot1 = ZonedDateTime.of(today, LocalTime.of(10, 0), ASUNCION).toInstant();
+        Instant slot2 = ZonedDateTime.of(today, LocalTime.of(11, 0), ASUNCION).toInstant();
+        when(appointmentService.findAvailableSlots(eq(1L), eq(3L), eq(4L), eq(today), anyInt()))
+                .thenReturn(List.of(slot1, slot2));
+
+        stubAi("¿Para cuándo tienen disponible y qué horarios?",
+                "INTENT: CHECK_AVAILABILITY\nCONFIDENCE: 0.8\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "¿Para cuándo tienen disponible y qué horarios?");
+
+        assertThat(result.getReply()).doesNotContain("¿Cuál te gustaría reservar?");
+        assertThat(result.getReply()).doesNotContain("• Corte Premium");
+        assertThat(result.getReply()).contains("•");
+        assertThat(result.getReply()).contains("10:00");
+        assertThat(result.getReply()).contains("11:00");
+        assertThat(result.getReply()).contains("Corte Premium");
+    }
+
+    // TEST 8 (AJUSTE 8): varios profesionales realizan el servicio -> se listan agrupados por
+    // profesional, cada uno con sus propios horarios reales.
+    @Test
+    void checkAvailabilityListGroupsByEmployeeWhenMultipleQualify() {
+        String phone = "+595981900002";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        Employee victor = employee(7L, "Victor", "Chamorro", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan, victor);
+        selectCortePremiumOnly(phone);
+
+        LocalDate today = LocalDate.now(ASUNCION);
+        when(appointmentService.findAvailableSlots(eq(1L), eq(3L), eq(4L), eq(today), anyInt()))
+                .thenReturn(List.of(ZonedDateTime.of(today, LocalTime.of(10, 0), ASUNCION).toInstant()));
+        when(appointmentService.findAvailableSlots(eq(1L), eq(7L), eq(4L), eq(today), anyInt()))
+                .thenReturn(List.of(ZonedDateTime.of(today, LocalTime.of(9, 0), ASUNCION).toInstant()));
+
+        stubAi("¿Qué horarios tienen?", "INTENT: CHECK_AVAILABILITY\nCONFIDENCE: 0.8\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "¿Qué horarios tienen?");
+
+        assertThat(result.getReply()).contains("Juan Gómez");
+        assertThat(result.getReply()).contains("Victor Chamorro");
+        assertThat(result.getReply()).contains("10:00");
+        assertThat(result.getReply()).contains("09:00");
+    }
+
+    // TEST 13: dentro de COLLECTING, tras pedir fecha/hora, una pregunta genérica de disponibilidad
+    // se interpreta contra el borrador actual (servicio ya elegido), no como una intención nueva
+    // desconectada ni como un volcado de texto libre de la IA.
+    @Test
+    void genericOptionsQuestionWhileCollectingUsesKnownDraftInsteadOfFreeText() {
+        String phone = "+595981900003";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan);
+        selectCortePremiumOnly(phone);
+
+        LocalDate today = LocalDate.now(ASUNCION);
+        when(appointmentService.findAvailableSlots(eq(1L), eq(3L), eq(4L), eq(today), anyInt()))
+                .thenReturn(List.of(ZonedDateTime.of(today, LocalTime.of(10, 0), ASUNCION).toInstant()));
+
+        stubAi("¿Qué opciones tienen?", "INTENT: CHECK_AVAILABILITY\nCONFIDENCE: 0.7\n"
+                + "REPLY: Déjame revisar la disponibilidad.");
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "¿Qué opciones tienen?");
+
+        assertThat(result.getReply()).doesNotContain("Déjame revisar");
+        assertThat(result.getReply()).doesNotContain("¿Para cuándo te gustaría el turno?");
+        assertThat(result.getReply()).contains("10:00");
+    }
+
+    // TEST 7 (AJUSTE 5/7): el nombre completo del profesional ("Juan Gómez") se resuelve
+    // correctamente contra el Employee real (antes solo se buscaba por firstName y colapsaba en el
+    // mensaje genérico), y el servicio ya elegido en el draft se conserva.
+    @Test
+    void fullNameEmployeeResolvesCorrectlyAndKeepsPreviouslyChosenService() {
+        String phone = "+595981900004";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan);
+        selectCortePremiumOnly(phone);
+
+        stubAi("Quiero para el jueves con Juan Gómez a las 10:00",
+                "INTENT: BOOK_APPOINTMENT\nEMPLOYEE_NAME: Juan Gómez\nSTART_AT: el próximo jueves a las 10:00\n"
+                        + "CONFIDENCE: 0.85\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero para el jueves con Juan Gómez a las 10:00");
+
+        assertThat(result.getReply()).doesNotContain("No encontré a ese profesional");
+        assertThat(result.getReply()).doesNotContain("no tenemos un profesional");
+        assertThat(result.getReply()).contains("Juan Gómez");
+        assertThat(result.getReply()).contains("Corte Premium");
+    }
+
+    // TEST 9: si el profesional explícito está realmente disponible, se pasa a confirmación
+    // (Resultado A), sin quedarse en una pregunta ni en un mensaje de error.
+    @Test
+    void explicitEmployeeAvailableAtRequestedTimeReachesConfirmation() {
+        String phone = "+595981900005";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan);
+        selectCortePremiumOnly(phone);
+
+        stubAi("Quiero para el jueves con Juan Gómez a las 10:00",
+                "INTENT: BOOK_APPOINTMENT\nEMPLOYEE_NAME: Juan Gómez\nSTART_AT: el próximo jueves a las 10:00\n"
+                        + "CONFIDENCE: 0.85\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero para el jueves con Juan Gómez a las 10:00");
+
+        assertThat(result.getReply()).contains("¿Confirmás?");
+    }
+
+    // TEST 8: un profesional explícito nunca se reemplaza en silencio por otro, aunque haya más de
+    // uno habilitado para el servicio.
+    @Test
+    void explicitEmployeeAmongSeveralNeverAutoSwapsToAnother() {
+        String phone = "+595981900006";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        Employee victor = employee(7L, "Victor", "Chamorro", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan, victor);
+        selectCortePremiumOnly(phone);
+
+        stubAi("Quiero para el jueves con Juan Gómez a las 10:00",
+                "INTENT: BOOK_APPOINTMENT\nEMPLOYEE_NAME: Juan Gómez\nSTART_AT: el próximo jueves a las 10:00\n"
+                        + "CONFIDENCE: 0.85\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero para el jueves con Juan Gómez a las 10:00");
+
+        assertThat(result.getReply()).contains("Juan Gómez");
+        assertThat(result.getReply()).doesNotContain("Victor");
+    }
+
+    // TEST 10 (Resultado B): el profesional explícito existe y realiza el servicio, pero está
+    // ocupado a esa hora -> mensaje específico de horario ocupado, nunca el genérico "no tenemos
+    // un profesional disponible para ese servicio".
+    @Test
+    void explicitEmployeeOccupiedGetsSpecificOccupiedMessage() {
+        String phone = "+595981900007";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan);
+        selectCortePremiumOnly(phone);
+
+        when(appointmentService.isAvailable(eq(1L), eq(3L), eq(4L), any(Instant.class))).thenReturn(false);
+        when(appointmentService.checkAvailability(eq(1L), eq(3L), eq(4L), any(Instant.class)))
+                .thenReturn(AvailabilityCheck.unavailable(AvailabilityReason.OVERLAPPING));
+
+        stubAi("Quiero para el jueves con Juan Gómez a las 10:00",
+                "INTENT: BOOK_APPOINTMENT\nEMPLOYEE_NAME: Juan Gómez\nSTART_AT: el próximo jueves a las 10:00\n"
+                        + "CONFIDENCE: 0.85\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero para el jueves con Juan Gómez a las 10:00");
+
+        assertThat(result.getReply()).contains("no está disponible");
+        assertThat(result.getReply()).contains("¿Querés elegir otro horario?");
+        assertThat(result.getReply()).doesNotContain("no tenemos un profesional disponible para ese servicio");
+    }
+
+    // TEST 11 (Resultado C): el profesional explícito existe y realiza el servicio, pero el
+    // horario pedido cae fuera de su Schedule -> mensaje específico distinto del de "ocupado".
+    @Test
+    void explicitEmployeeOutsideScheduleGetsSpecificMessage() {
+        String phone = "+595981900008";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan);
+        selectCortePremiumOnly(phone);
+
+        when(appointmentService.isAvailable(eq(1L), eq(3L), eq(4L), any(Instant.class))).thenReturn(false);
+        when(appointmentService.checkAvailability(eq(1L), eq(3L), eq(4L), any(Instant.class)))
+                .thenReturn(AvailabilityCheck.unavailable(AvailabilityReason.OUTSIDE_SCHEDULE));
+
+        stubAi("Quiero para el jueves con Juan Gómez a las 10:00",
+                "INTENT: BOOK_APPOINTMENT\nEMPLOYEE_NAME: Juan Gómez\nSTART_AT: el próximo jueves a las 10:00\n"
+                        + "CONFIDENCE: 0.85\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero para el jueves con Juan Gómez a las 10:00");
+
+        assertThat(result.getReply()).contains("no atiende");
+        assertThat(result.getReply()).contains("¿Querés ver otros horarios disponibles?");
+    }
+
+    // TEST 12 (Resultado D): el profesional explícito existe pero no realiza ese servicio ->
+    // mensaje específico, distinto de "ocupado" y de "fuera de horario".
+    @Test
+    void explicitEmployeeCannotPerformServiceGetsSpecificMessage() {
+        String phone = "+595981900009";
+        existingCustomer(phone, "Cristian");
+        Service corte = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corte);
+        stubServiceLookup("Corte Premium", corte);
+        stubEmployeeListing(juan);
+        selectCortePremiumOnly(phone);
+
+        when(appointmentService.isAvailable(eq(1L), eq(3L), eq(4L), any(Instant.class))).thenReturn(false);
+        when(appointmentService.checkAvailability(eq(1L), eq(3L), eq(4L), any(Instant.class)))
+                .thenReturn(AvailabilityCheck.unavailable(AvailabilityReason.EMPLOYEE_CANNOT_PERFORM_SERVICE));
+
+        stubAi("Quiero para el jueves con Juan Gómez a las 10:00",
+                "INTENT: BOOK_APPOINTMENT\nEMPLOYEE_NAME: Juan Gómez\nSTART_AT: el próximo jueves a las 10:00\n"
+                        + "CONFIDENCE: 0.85\nREPLY: no importa");
+        ConversationResponse result = conversationService.processChannelConversation(
+                1L, phone, "Quiero para el jueves con Juan Gómez a las 10:00");
+
+        assertThat(result.getReply()).contains("no realiza Corte Premium");
+        assertThat(result.getReply()).contains("¿Querés ver qué profesionales están disponibles para ese servicio?");
+    }
+
+    // TEST 14: cuando el servicio ya se conoce, la disponibilidad se consulta con su duración real
+    // (nunca el default de 30 minutos de una consulta sin servicio): serviceId siempre viaja al
+    // pedir la lista de horarios.
+    @Test
+    void availabilityListAlwaysPassesKnownServiceIdNeverDefaultsToNoService() {
+        String phone = "+595981900013";
+        existingCustomer(phone, "Cristian");
+        Service corteBarba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        Employee juan = employee(3L, "Juan", "Gómez", corteBarba);
+        stubServiceLookup("Corte Barba", corteBarba);
+        stubEmployeeListing(juan);
+
+        stubAi("Corte Barba", "INTENT: BOOK_APPOINTMENT\nSERVICE_NAME: Corte Barba\nCONFIDENCE: 0.9\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "Corte Barba");
+
+        stubAi("¿Qué horarios tienen?", "INTENT: CHECK_AVAILABILITY\nCONFIDENCE: 0.8\nREPLY: no importa");
+        conversationService.processChannelConversation(1L, phone, "¿Qué horarios tienen?");
+
+        verify(appointmentService, never()).findAvailableSlots(anyLong(), anyLong(), isNull(), any(LocalDate.class), anyInt());
+        verify(appointmentService, org.mockito.Mockito.atLeastOnce())
+                .findAvailableSlots(eq(1L), eq(3L), eq(6L), any(LocalDate.class), anyInt());
     }
 
 }
