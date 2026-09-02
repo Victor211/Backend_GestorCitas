@@ -4,8 +4,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationResponse;
 import com.victor.appointmentmanager.api.modules.ai.service.ConversationService;
+import com.victor.appointmentmanager.api.modules.conversations.service.ConversationMessageService;
 import com.victor.appointmentmanager.api.modules.whatsapp.client.WhatsAppClient;
 import com.victor.appointmentmanager.api.modules.whatsapp.config.WhatsAppSignatureValidator;
+import com.victor.appointmentmanager.api.modules.whatsapp.dto.response.WhatsAppSendMessageResponse;
 import com.victor.appointmentmanager.api.modules.whatsapp.dto.webhook.WhatsAppInboundMessage;
 import com.victor.appointmentmanager.api.modules.whatsapp.dto.webhook.WhatsAppWebhookChange;
 import com.victor.appointmentmanager.api.modules.whatsapp.dto.webhook.WhatsAppWebhookEntry;
@@ -41,6 +43,7 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
     private final WhatsAppInboundEventRepository inboundEventRepository;
     private final WhatsAppInboundEventTracker eventTracker;
     private final ConversationService conversationService;
+    private final ConversationMessageService conversationMessageService;
     private final WhatsAppClient whatsAppClient;
     private final String verifyToken;
 
@@ -50,6 +53,7 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
                                        WhatsAppInboundEventRepository inboundEventRepository,
                                        WhatsAppInboundEventTracker eventTracker,
                                        ConversationService conversationService,
+                                       ConversationMessageService conversationMessageService,
                                        WhatsAppClient whatsAppClient,
                                        @Value("${app.whatsapp.verify-token}") String verifyToken) {
         this.objectMapper = objectMapper;
@@ -58,6 +62,7 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
         this.inboundEventRepository = inboundEventRepository;
         this.eventTracker = eventTracker;
         this.conversationService = conversationService;
+        this.conversationMessageService = conversationMessageService;
         this.whatsAppClient = whatsAppClient;
         this.verifyToken = verifyToken;
     }
@@ -162,8 +167,13 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
             return;
         }
 
+        String inboundText = message.getText().getBody();
+        // Se guarda el texto EXACTO recibido antes de que el bot lo procese: el historial debe
+        // reflejar lo que el cliente escribió incluso si el procesamiento posterior falla.
+        recordInboundHistory(business.getId(), message.getFrom(), message.getId(), inboundText);
+
         ConversationResponse response = conversationService.processChannelConversation(
-                business.getId(), message.getFrom(), message.getText().getBody());
+                business.getId(), message.getFrom(), inboundText);
 
         if (response == null || response.getReply() == null || response.getReply().isBlank()) {
             log.warn("ConversationService devolvió una respuesta vacía. businessId={}", business.getId());
@@ -179,7 +189,44 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
             log.warn("El negocio no tiene whatsappPhoneNumberId configurado. businessId={}", business.getId());
             return;
         }
-        whatsAppClient.sendTextMessage(business.getWhatsappPhoneNumberId(), recipientPhone, replyText);
+        WhatsAppSendMessageResponse response =
+                whatsAppClient.sendTextMessage(business.getWhatsappPhoneNumberId(), recipientPhone, replyText);
+        // Se guarda solo lo que efectivamente llegó al punto de enviarse (sendTextMessage no lanzó
+        // excepción): si Cloud API rechaza el envío, no se registra un OUTBOUND que nunca salió.
+        recordOutboundHistory(business.getId(), recipientPhone, extractOutboundMessageId(response), replyText);
+    }
+
+    /**
+     * Aísla los fallos de persistencia del historial del flujo real del bot: si guardar el
+     * historial falla (ej. problema puntual de base de datos), el cliente igual debe recibir su
+     * respuesta y el mensaje no debe marcarse como fallido en whatsapp_inbound_events por una causa
+     * ajena al procesamiento real. El error se registra igual, nunca se descarta en silencio.
+     */
+    private void recordInboundHistory(Long businessId, String senderPhone, String externalMessageId,
+                                       String content) {
+        try {
+            conversationMessageService.recordInbound(businessId, senderPhone, externalMessageId, content);
+        } catch (RuntimeException ex) {
+            log.error("No se pudo persistir el historial INBOUND. businessId={}, senderPhone={}, error={}",
+                    businessId, maskPhone(senderPhone), ex.getMessage());
+        }
+    }
+
+    private void recordOutboundHistory(Long businessId, String recipientPhone, String externalMessageId,
+                                        String content) {
+        try {
+            conversationMessageService.recordOutbound(businessId, recipientPhone, externalMessageId, content);
+        } catch (RuntimeException ex) {
+            log.error("No se pudo persistir el historial OUTBOUND. businessId={}, senderPhone={}, error={}",
+                    businessId, maskPhone(recipientPhone), ex.getMessage());
+        }
+    }
+
+    private static String extractOutboundMessageId(WhatsAppSendMessageResponse response) {
+        if (response == null || response.getMessages() == null || response.getMessages().isEmpty()) {
+            return null;
+        }
+        return response.getMessages().get(0).getId();
     }
 
     private String sanitizeErrorMessage(RuntimeException ex) {

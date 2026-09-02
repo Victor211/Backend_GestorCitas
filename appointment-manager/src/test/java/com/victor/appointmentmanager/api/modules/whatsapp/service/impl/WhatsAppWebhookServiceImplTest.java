@@ -4,8 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationResponse;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationIntent;
 import com.victor.appointmentmanager.api.modules.ai.service.ConversationService;
+import com.victor.appointmentmanager.api.modules.conversations.service.ConversationMessageService;
 import com.victor.appointmentmanager.api.modules.whatsapp.client.WhatsAppClient;
 import com.victor.appointmentmanager.api.modules.whatsapp.config.WhatsAppSignatureValidator;
+import com.victor.appointmentmanager.api.modules.whatsapp.dto.response.WhatsAppSendMessageResponse;
 import com.victor.appointmentmanager.api.modules.whatsapp.entity.WhatsAppInboundEvent;
 import com.victor.appointmentmanager.api.modules.whatsapp.exception.WhatsAppApiException;
 import com.victor.appointmentmanager.api.modules.whatsapp.repository.WhatsAppInboundEventRepository;
@@ -14,9 +16,11 @@ import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -24,6 +28,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -47,6 +53,9 @@ class WhatsAppWebhookServiceImplTest {
     private ConversationService conversationService;
 
     @Mock
+    private ConversationMessageService conversationMessageService;
+
+    @Mock
     private WhatsAppClient whatsAppClient;
 
     private WhatsAppWebhookServiceImpl webhookService;
@@ -57,7 +66,8 @@ class WhatsAppWebhookServiceImplTest {
     void setUp() {
         webhookService = new WhatsAppWebhookServiceImpl(
                 new ObjectMapper(), signatureValidator, businessRepository, inboundEventRepository,
-                eventTracker, conversationService, whatsAppClient, "expected-verify-token");
+                eventTracker, conversationService, conversationMessageService, whatsAppClient,
+                "expected-verify-token");
 
         business = new Business();
         business.setId(1L);
@@ -160,12 +170,28 @@ class WhatsAppWebhookServiceImplTest {
         when(conversationService.processChannelConversation(1L, "595981000000", "Hola"))
                 .thenReturn(conversationResponse);
 
+        WhatsAppSendMessageResponse.SentMessage sentMessage = new WhatsAppSendMessageResponse.SentMessage();
+        sentMessage.setId("wamid.OUT1");
+        WhatsAppSendMessageResponse sendResponse = new WhatsAppSendMessageResponse();
+        sendResponse.setMessages(List.of(sentMessage));
+        when(whatsAppClient.sendTextMessage("PHONE_ID_1", "595981000000", "¡Hola! ¿En qué puedo ayudarte?"))
+                .thenReturn(sendResponse);
+
         webhookService.processWebhook(textMessagePayload("wamid.MSG1", "595981000000", "Hola"));
 
         verify(conversationService).processChannelConversation(1L, "595981000000", "Hola");
         verify(whatsAppClient).sendTextMessage("PHONE_ID_1", "595981000000", "¡Hola! ¿En qué puedo ayudarte?");
         verify(eventTracker).markProcessed(100L);
         verify(eventTracker, never()).markFailed(any(), anyString());
+
+        // INBOUND se guarda con el texto exacto ANTES de invocar al bot; OUTBOUND se guarda DESPUÉS
+        // de que Cloud API aceptó el envío, con el id real que devolvió Meta.
+        InOrder order = inOrder(conversationMessageService, conversationService, whatsAppClient);
+        order.verify(conversationMessageService).recordInbound(1L, "595981000000", "wamid.MSG1", "Hola");
+        order.verify(conversationService).processChannelConversation(1L, "595981000000", "Hola");
+        order.verify(whatsAppClient).sendTextMessage("PHONE_ID_1", "595981000000", "¡Hola! ¿En qué puedo ayudarte?");
+        order.verify(conversationMessageService).recordOutbound(1L, "595981000000", "wamid.OUT1",
+                "¡Hola! ¿En qué puedo ayudarte?");
     }
 
     @Test
@@ -189,6 +215,8 @@ class WhatsAppWebhookServiceImplTest {
 
         verify(businessRepository, never()).findByWhatsappPhoneNumberIdAndActiveTrue(any());
         verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
+        verify(conversationMessageService, never()).recordInbound(any(), any(), any(), any());
+        verify(conversationMessageService, never()).recordOutbound(any(), any(), any(), any());
     }
 
     @Test
@@ -234,6 +262,12 @@ class WhatsAppWebhookServiceImplTest {
         verify(whatsAppClient).sendTextMessage(eq("PHONE_ID_1"), eq("595981000000"),
                 eq("Por el momento solo puedo procesar mensajes de texto."));
         verify(eventTracker).markProcessed(101L);
+        // El tipo no soportado (imagen) nunca se guarda como INBOUND: ConversationMessage.messageType
+        // solo admite TEXT en este MVP. El aviso de "no puedo procesar" sí es un mensaje de texto
+        // real que el cliente recibió, así que se guarda como OUTBOUND.
+        verify(conversationMessageService, never()).recordInbound(any(), any(), any(), any());
+        verify(conversationMessageService).recordOutbound(eq(1L), eq("595981000000"), isNull(),
+                eq("Por el momento solo puedo procesar mensajes de texto."));
     }
 
     @Test
@@ -251,6 +285,10 @@ class WhatsAppWebhookServiceImplTest {
         verify(eventTracker).markFailed(eq(102L), anyString());
         verify(eventTracker, never()).markProcessed(any());
         verify(whatsAppClient, never()).sendTextMessage(any(), any(), any());
+        // El INBOUND se guarda ANTES de invocar al bot, así que sobrevive aunque el bot falle.
+        verify(conversationMessageService).recordInbound(1L, "595981000000", "wamid.MSG5", "Hola");
+        // Nunca se llegó al punto de enviar una respuesta: no debe registrarse ningún OUTBOUND.
+        verify(conversationMessageService, never()).recordOutbound(any(), any(), any(), any());
     }
 
     @Test
@@ -272,6 +310,35 @@ class WhatsAppWebhookServiceImplTest {
 
         verify(eventTracker).markFailed(eq(103L), anyString());
         verify(eventTracker, never()).markProcessed(any());
+        // El envío nunca llegó a completarse (Cloud API rechazó el mensaje): no hay nada que
+        // guardar como OUTBOUND.
+        verify(conversationMessageService, never()).recordOutbound(any(), any(), any(), any());
+    }
+
+    @Test
+    void historyPersistenceFailureDoesNotBlockBotReply() {
+        // Requisito explícito del MVP 2 (Fase 1): una falla al persistir el historial nunca debe
+        // impedir que el bot responda al cliente ni afectar el resultado del procesamiento.
+        when(inboundEventRepository.findByExternalMessageId("wamid.MSG7")).thenReturn(Optional.empty());
+        when(businessRepository.findByWhatsappPhoneNumberIdAndActiveTrue("PHONE_ID_1"))
+                .thenReturn(Optional.of(business));
+        when(eventTracker.registerReceived(1L, "wamid.MSG7", "595981000000", "text"))
+                .thenReturn(existingEvent(104L));
+
+        ConversationResponse conversationResponse = new ConversationResponse(
+                "Respuesta", ConversationIntent.UNKNOWN, 0.1, null);
+        when(conversationService.processChannelConversation(anyLong(), anyString(), anyString()))
+                .thenReturn(conversationResponse);
+        org.mockito.Mockito.doThrow(new RuntimeException("fallo de base de datos"))
+                .when(conversationMessageService).recordInbound(any(), any(), any(), any());
+        org.mockito.Mockito.doThrow(new RuntimeException("fallo de base de datos"))
+                .when(conversationMessageService).recordOutbound(any(), any(), any(), any());
+
+        webhookService.processWebhook(textMessagePayload("wamid.MSG7", "595981000000", "Hola"));
+
+        verify(whatsAppClient).sendTextMessage("PHONE_ID_1", "595981000000", "Respuesta");
+        verify(eventTracker).markProcessed(104L);
+        verify(eventTracker, never()).markFailed(any(), anyString());
     }
 
     @Test
