@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationResponse;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationIntent;
 import com.victor.appointmentmanager.api.modules.ai.service.ConversationService;
+import com.victor.appointmentmanager.api.modules.conversations.entity.Conversation;
+import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationMode;
 import com.victor.appointmentmanager.api.modules.conversations.service.ConversationMessageService;
 import com.victor.appointmentmanager.api.modules.whatsapp.client.WhatsAppClient;
 import com.victor.appointmentmanager.api.modules.whatsapp.config.WhatsAppSignatureValidator;
@@ -155,6 +157,13 @@ class WhatsAppWebhookServiceImplTest {
         WhatsAppInboundEvent event = new WhatsAppInboundEvent();
         event.setId(id);
         return event;
+    }
+
+    private Conversation conversationWithMode(Long id, ConversationMode mode) {
+        Conversation conversation = new Conversation();
+        conversation.setId(id);
+        conversation.setMode(mode);
+        return conversation;
     }
 
     @Test
@@ -339,6 +348,77 @@ class WhatsAppWebhookServiceImplTest {
         verify(whatsAppClient).sendTextMessage("PHONE_ID_1", "595981000000", "Respuesta");
         verify(eventTracker).markProcessed(104L);
         verify(eventTracker, never()).markFailed(any(), anyString());
+    }
+
+    // ------------------------------------------------------------------
+    // MVP 3 - Fase 1: control BOT/HUMAN
+    // ------------------------------------------------------------------
+
+    @Test
+    void botModeConversationContinuesRespondingAutomatically() {
+        when(inboundEventRepository.findByExternalMessageId("wamid.BOT1")).thenReturn(Optional.empty());
+        when(businessRepository.findByWhatsappPhoneNumberIdAndActiveTrue("PHONE_ID_1"))
+                .thenReturn(Optional.of(business));
+        when(eventTracker.registerReceived(1L, "wamid.BOT1", "595981000000", "text"))
+                .thenReturn(existingEvent(200L));
+        when(conversationMessageService.recordInbound(1L, "595981000000", "wamid.BOT1", "Hola"))
+                .thenReturn(conversationWithMode(15L, ConversationMode.BOT));
+
+        ConversationResponse conversationResponse = new ConversationResponse(
+                "¡Hola!", ConversationIntent.GREETING, 0.9, null);
+        when(conversationService.processChannelConversation(1L, "595981000000", "Hola"))
+                .thenReturn(conversationResponse);
+        when(whatsAppClient.sendTextMessage("PHONE_ID_1", "595981000000", "¡Hola!"))
+                .thenReturn(new WhatsAppSendMessageResponse());
+
+        webhookService.processWebhook(textMessagePayload("wamid.BOT1", "595981000000", "Hola"));
+
+        verify(conversationService).processChannelConversation(1L, "595981000000", "Hola");
+        verify(whatsAppClient).sendTextMessage("PHONE_ID_1", "595981000000", "¡Hola!");
+        verify(eventTracker).markProcessed(200L);
+    }
+
+    @Test
+    void humanModeSkipsAutomaticProcessingButKeepsHistoryAndFinishesSuccessfully() {
+        when(inboundEventRepository.findByExternalMessageId("wamid.HUMAN1")).thenReturn(Optional.empty());
+        when(businessRepository.findByWhatsappPhoneNumberIdAndActiveTrue("PHONE_ID_1"))
+                .thenReturn(Optional.of(business));
+        when(eventTracker.registerReceived(1L, "wamid.HUMAN1", "595981000000", "text"))
+                .thenReturn(existingEvent(201L));
+        when(conversationMessageService.recordInbound(1L, "595981000000", "wamid.HUMAN1", "Hola"))
+                .thenReturn(conversationWithMode(15L, ConversationMode.HUMAN));
+
+        webhookService.processWebhook(textMessagePayload("wamid.HUMAN1", "595981000000", "Hola"));
+
+        // El INBOUND sí se persiste (unreadCount/lastMessagePreview ya se actualizaron dentro de
+        // recordInbound antes de que este test pueda inspeccionar el resultado).
+        verify(conversationMessageService).recordInbound(1L, "595981000000", "wamid.HUMAN1", "Hola");
+        // Pero el bot no procesa ni responde: ni OpenAI/ConversationService, ni WhatsApp, ni OUTBOUND.
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
+        verify(whatsAppClient, never()).sendTextMessage(any(), any(), any());
+        verify(conversationMessageService, never()).recordOutbound(any(), any(), any(), any());
+        // El webhook termina exitosamente: se marca PROCESSED, nunca FAILED.
+        verify(eventTracker).markProcessed(201L);
+        verify(eventTracker, never()).markFailed(any(), anyString());
+    }
+
+    @Test
+    void resetCommandInHumanModeDoesNotInvokeBotAndConversationStaysSilenced() {
+        when(inboundEventRepository.findByExternalMessageId("wamid.RESET1")).thenReturn(Optional.empty());
+        when(businessRepository.findByWhatsappPhoneNumberIdAndActiveTrue("PHONE_ID_1"))
+                .thenReturn(Optional.of(business));
+        when(eventTracker.registerReceived(1L, "wamid.RESET1", "595981000000", "text"))
+                .thenReturn(existingEvent(202L));
+        when(conversationMessageService.recordInbound(1L, "595981000000", "wamid.RESET1", "/reset"))
+                .thenReturn(conversationWithMode(15L, ConversationMode.HUMAN));
+
+        webhookService.processWebhook(textMessagePayload("wamid.RESET1", "595981000000", "/reset"));
+
+        // /reset nunca llega a ConversationServiceImpl mientras la conversación esté HUMAN: no hay
+        // forma de que el cliente reactive el bot por texto, ni de que ConversationState se toque.
+        verify(conversationService, never()).processChannelConversation(anyLong(), anyString(), anyString());
+        verify(whatsAppClient, never()).sendTextMessage(any(), any(), any());
+        verify(eventTracker).markProcessed(202L);
     }
 
     @Test

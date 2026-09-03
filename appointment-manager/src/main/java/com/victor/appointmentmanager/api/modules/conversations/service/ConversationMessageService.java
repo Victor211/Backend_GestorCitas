@@ -2,6 +2,7 @@ package com.victor.appointmentmanager.api.modules.conversations.service;
 
 import com.victor.appointmentmanager.api.modules.conversations.entity.Conversation;
 import com.victor.appointmentmanager.api.modules.conversations.entity.ConversationMessage;
+import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationMode;
 import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationStatus;
 import com.victor.appointmentmanager.api.modules.conversations.enums.MessageDirection;
 import com.victor.appointmentmanager.api.modules.conversations.enums.MessageSenderType;
@@ -50,8 +51,13 @@ public class ConversationMessageService {
     private final ConversationMessageRepository conversationMessageRepository;
     private final CustomerRepository customerRepository;
 
+    /**
+     * @return la {@link Conversation} ya persistida, para que el llamador (ver
+     * {@code WhatsAppWebhookServiceImpl}) pueda leer {@code mode} sin una consulta aparte y decidir
+     * si corresponde procesar la respuesta automática del bot (MVP 3 - Fase 1).
+     */
     @Transactional
-    public void recordInbound(Long businessId, String senderPhone, String externalMessageId, String content) {
+    public Conversation recordInbound(Long businessId, String senderPhone, String externalMessageId, String content) {
         Conversation conversation = findOrCreateConversation(businessId, senderPhone);
 
         ConversationMessage message = new ConversationMessage();
@@ -69,6 +75,8 @@ public class ConversationMessageService {
         conversation.setLastMessagePreview(preview(content));
         conversation.setUnreadCount(conversation.getUnreadCount() + 1);
         conversationRepository.save(conversation);
+
+        return conversation;
     }
 
     @Transactional
@@ -135,6 +143,7 @@ public class ConversationMessageService {
         conversation.setBusinessId(businessId);
         conversation.setSenderPhone(senderPhone);
         conversation.setStatus(ConversationStatus.ACTIVE);
+        conversation.setMode(ConversationMode.BOT);
         conversation.setStartedAt(Instant.now());
         conversation.setUnreadCount(0);
         return conversation;

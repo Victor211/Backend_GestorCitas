@@ -1,10 +1,12 @@
 package com.victor.appointmentmanager.api.modules.conversations.mapper;
 
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationMessageResponse;
+import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationModeResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationReadResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationSummaryResponse;
 import com.victor.appointmentmanager.api.modules.conversations.entity.Conversation;
 import com.victor.appointmentmanager.api.modules.conversations.entity.ConversationMessage;
+import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationMode;
 import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationStatus;
 import com.victor.appointmentmanager.api.modules.conversations.enums.MessageDirection;
 import com.victor.appointmentmanager.api.modules.conversations.enums.MessageSenderType;
@@ -53,6 +55,7 @@ class ConversationMapperTest {
         assertThat(response.getCustomerName()).isEqualTo("Juan Pérez");
         assertThat(response.getSenderPhone()).isEqualTo("595981123456");
         assertThat(response.getStatus()).isEqualTo(ConversationStatus.ACTIVE);
+        assertThat(response.getMode()).isEqualTo(ConversationMode.BOT);
         assertThat(response.getLastMessagePreview()).isEqualTo("Perfecto, tu turno quedó reservado...");
         assertThat(response.getUnreadCount()).isEqualTo(3);
     }
@@ -112,6 +115,17 @@ class ConversationMapperTest {
 
         assertThat(response.getId()).isEqualTo(15L);
         assertThat(response.getUnreadCount()).isZero();
+    }
+
+    @Test
+    void mapsModeResponse() {
+        Conversation conversation = buildConversation();
+        conversation.setMode(ConversationMode.HUMAN);
+
+        ConversationModeResponse response = mapper.toModeResponse(conversation);
+
+        assertThat(response.getId()).isEqualTo(15L);
+        assertThat(response.getMode()).isEqualTo(ConversationMode.HUMAN);
     }
 
 }

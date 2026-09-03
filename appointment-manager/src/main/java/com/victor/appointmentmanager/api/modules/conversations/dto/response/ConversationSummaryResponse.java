@@ -1,5 +1,6 @@
 package com.victor.appointmentmanager.api.modules.conversations.dto.response;
 
+import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationMode;
 import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationStatus;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
@@ -24,6 +25,7 @@ public class ConversationSummaryResponse {
     private String customerName;
     private String senderPhone;
     private ConversationStatus status;
+    private ConversationMode mode;
     private Instant lastMessageAt;
     private String lastMessagePreview;
     private int unreadCount;

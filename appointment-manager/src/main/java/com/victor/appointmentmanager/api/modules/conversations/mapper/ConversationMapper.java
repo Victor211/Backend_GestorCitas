@@ -1,6 +1,7 @@
 package com.victor.appointmentmanager.api.modules.conversations.mapper;
 
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationMessageResponse;
+import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationModeResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationReadResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationSummaryResponse;
 import com.victor.appointmentmanager.api.modules.conversations.entity.Conversation;
@@ -25,6 +26,7 @@ public interface ConversationMapper {
     @Mapping(target = "customerName", source = "customer", qualifiedByName = "toCustomerFullName")
     @Mapping(target = "senderPhone", source = "conversation.senderPhone")
     @Mapping(target = "status", source = "conversation.status")
+    @Mapping(target = "mode", source = "conversation.mode")
     @Mapping(target = "lastMessageAt", source = "conversation.lastMessageAt")
     @Mapping(target = "lastMessagePreview", source = "conversation.lastMessagePreview")
     @Mapping(target = "unreadCount", source = "conversation.unreadCount")
@@ -33,6 +35,8 @@ public interface ConversationMapper {
     ConversationMessageResponse toMessageResponse(ConversationMessage message);
 
     ConversationReadResponse toReadResponse(Conversation conversation);
+
+    ConversationModeResponse toModeResponse(Conversation conversation);
 
     @Named("toCustomerFullName")
     default String toCustomerFullName(Customer customer) {

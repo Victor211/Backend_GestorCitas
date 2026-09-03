@@ -2,6 +2,7 @@ package com.victor.appointmentmanager.api.modules.conversations.service;
 
 import com.victor.appointmentmanager.api.modules.conversations.entity.Conversation;
 import com.victor.appointmentmanager.api.modules.conversations.entity.ConversationMessage;
+import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationMode;
 import com.victor.appointmentmanager.api.modules.conversations.enums.MessageDirection;
 import com.victor.appointmentmanager.api.modules.conversations.enums.MessageSenderType;
 import com.victor.appointmentmanager.api.modules.conversations.enums.MessageType;
@@ -97,6 +98,8 @@ class ConversationMessageServiceTest {
         assertThat(saved.getSenderPhone()).isEqualTo(SENDER_PHONE);
         assertThat(saved.getStartedAt()).isNotNull();
         assertThat(saved.getId()).isNotNull();
+        // MVP 3 - Fase 1: toda Conversation nueva empieza en BOT; nadie la tomó todavía.
+        assertThat(saved.getMode()).isEqualTo(ConversationMode.BOT);
     }
 
     /**
@@ -245,6 +248,28 @@ class ConversationMessageServiceTest {
         assertThat(saved.getLastMessageAt()).isNotNull();
         assertThat(saved.getLastMessagePreview()).isEqualTo("Hola de nuevo");
         assertThat(saved.getUnreadCount()).isEqualTo(4);
+    }
+
+    /**
+     * MVP 3 - Fase 1: el takeover solo desactiva la respuesta automática (ver
+     * WhatsAppWebhookServiceImplTest), nunca el historial. Con la conversación en HUMAN,
+     * recordInbound debe seguir persistiendo el mensaje e incrementando unreadCount exactamente
+     * igual que en BOT.
+     */
+    @Test
+    void inboundStillIncrementsUnreadCountAndReturnsConversationWhenModeIsHuman() {
+        Conversation existing = existingConversation(10L, BUSINESS_ID, SENDER_PHONE, null, 0);
+        existing.setMode(ConversationMode.HUMAN);
+        when(conversationRepository.findByBusinessIdAndSenderPhone(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.of(existing));
+        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.empty());
+
+        Conversation result = service.recordInbound(BUSINESS_ID, SENDER_PHONE, "wamid.1", "Hola");
+
+        assertThat(result.getMode()).isEqualTo(ConversationMode.HUMAN);
+        assertThat(result.getUnreadCount()).isEqualTo(1);
+        assertThat(result.getLastMessagePreview()).isEqualTo("Hola");
     }
 
     // ------------------------------------------------------------------

@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.victor.appointmentmanager.api.modules.ai.dto.response.ConversationResponse;
 import com.victor.appointmentmanager.api.modules.ai.service.ConversationService;
+import com.victor.appointmentmanager.api.modules.conversations.entity.Conversation;
+import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationMode;
 import com.victor.appointmentmanager.api.modules.conversations.service.ConversationMessageService;
 import com.victor.appointmentmanager.api.modules.whatsapp.client.WhatsAppClient;
 import com.victor.appointmentmanager.api.modules.whatsapp.config.WhatsAppSignatureValidator;
@@ -170,7 +172,19 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
         String inboundText = message.getText().getBody();
         // Se guarda el texto EXACTO recibido antes de que el bot lo procese: el historial debe
         // reflejar lo que el cliente escribió incluso si el procesamiento posterior falla.
-        recordInboundHistory(business.getId(), message.getFrom(), message.getId(), inboundText);
+        Conversation conversation = recordInboundHistory(business.getId(), message.getFrom(), message.getId(),
+                inboundText);
+
+        // Punto de corte MVP 3 - Fase 1: si un operador tomó la conversación, el INBOUND ya quedó
+        // persistido (historial + unreadCount) arriba, pero el bot no debe procesar ni responder.
+        // `conversation` es null solo si recordInboundHistory falló al persistir (ver su Javadoc);
+        // en ese caso se sigue el comportamiento previo a esta fase y se procesa igual, ya que no
+        // hay forma de conocer el modo real sin la fila persistida.
+        if (conversation != null && conversation.getMode() == ConversationMode.HUMAN) {
+            log.info("Conversation {} en modo HUMAN; respuesta automática omitida. businessId={}",
+                    conversation.getId(), business.getId());
+            return;
+        }
 
         ConversationResponse response = conversationService.processChannelConversation(
                 business.getId(), message.getFrom(), inboundText);
@@ -202,13 +216,14 @@ public class WhatsAppWebhookServiceImpl implements WhatsAppWebhookService {
      * respuesta y el mensaje no debe marcarse como fallido en whatsapp_inbound_events por una causa
      * ajena al procesamiento real. El error se registra igual, nunca se descarta en silencio.
      */
-    private void recordInboundHistory(Long businessId, String senderPhone, String externalMessageId,
-                                       String content) {
+    private Conversation recordInboundHistory(Long businessId, String senderPhone, String externalMessageId,
+                                               String content) {
         try {
-            conversationMessageService.recordInbound(businessId, senderPhone, externalMessageId, content);
+            return conversationMessageService.recordInbound(businessId, senderPhone, externalMessageId, content);
         } catch (RuntimeException ex) {
             log.error("No se pudo persistir el historial INBOUND. businessId={}, senderPhone={}, error={}",
                     businessId, maskPhone(senderPhone), ex.getMessage());
+            return null;
         }
     }
 

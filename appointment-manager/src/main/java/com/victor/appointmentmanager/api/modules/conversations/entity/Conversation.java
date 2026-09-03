@@ -1,6 +1,7 @@
 package com.victor.appointmentmanager.api.modules.conversations.entity;
 
 import com.victor.appointmentmanager.api.common.entity.BaseEntity;
+import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationMode;
 import com.victor.appointmentmanager.api.modules.conversations.enums.ConversationStatus;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -56,6 +57,17 @@ public class Conversation extends BaseEntity {
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
     private ConversationStatus status = ConversationStatus.ACTIVE;
+
+    /**
+     * Quién controla la conversación: {@code BOT} (respuesta automática, default) o
+     * {@code HUMAN} (un operador la tomó desde el panel y el bot deja de responder). Persistente
+     * a propósito (MVP 3 - Fase 1): sobrevive a reinicios del backend y a {@code /reset}, a
+     * diferencia de {@link com.victor.appointmentmanager.api.modules.ai.entity.ConversationState},
+     * que es memoria temporal del flujo del bot.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 10)
+    private ConversationMode mode = ConversationMode.BOT;
 
     @Column(name = "started_at", nullable = false)
     private Instant startedAt;
