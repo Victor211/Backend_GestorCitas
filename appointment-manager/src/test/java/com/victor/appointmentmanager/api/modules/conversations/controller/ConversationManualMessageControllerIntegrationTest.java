@@ -360,7 +360,66 @@ class ConversationManualMessageControllerIntegrationTest {
         mockMvc.perform(post("/api/conversations/1/messages")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(requestBody("Hola")))
-                .andExpect(status().isUnauthorized());
+                .andExpect(status().isUnauthorized())
+                // El código HTTP real debe coincidir con el campo "status" del payload: si alguna
+                // vez un error interno se mapea incorrectamente a "No autenticado" (500 real con
+                // status:401 en el body), este assert lo detecta.
+                .andExpect(jsonPath("$.status").value(401));
+    }
+
+    /**
+     * MVP 3 - Fase 3 (bug report): comprueba explícitamente que POST /{id}/messages, autenticado
+     * con el MISMO token, tiene la misma paridad de autenticación que PUT /{id}/takeover y
+     * PUT /{id}/release - ninguno de los tres debe rechazar el token con 401, y en cada respuesta
+     * el código HTTP real coincide con el campo "status" del body (ApiResponse/ApiError).
+     */
+    @Test
+    void postMessagesHasSameAuthenticationParityAsTakeoverAndRelease() throws Exception {
+        JsonNode owner = register("manual-parity@example.com", "Negocio Manual Parity");
+        String token = owner.path("accessToken").asText();
+        long businessId = owner.path("user").path("businessId").asLong();
+        assignWhatsAppPhoneNumberId(businessId, "PHONE_PARITY");
+
+        String phone = uniquePhone();
+        conversationMessageService.recordInbound(businessId, phone, "wamid.in." + phone, "Hola");
+        long conversationId = findConversationId(token, phone);
+
+        var takeoverResult = mockMvc.perform(put("/api/conversations/" + conversationId + "/takeover")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn();
+        assertHttpStatusMatchesJsonStatus(takeoverResult, 200);
+
+        when(whatsAppClient.sendTextMessage(eq("PHONE_PARITY"), eq(phone), anyString()))
+                .thenReturn(successResponse("wamid.PARITY1"));
+
+        var messagesResult = mockMvc.perform(post("/api/conversations/" + conversationId + "/messages")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("Mensaje de paridad")))
+                .andExpect(status().isCreated())
+                .andReturn();
+        assertHttpStatusMatchesJsonStatus(messagesResult, 201);
+
+        var releaseResult = mockMvc.perform(put("/api/conversations/" + conversationId + "/release")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn();
+        assertHttpStatusMatchesJsonStatus(releaseResult, 200);
+    }
+
+    private void assertHttpStatusMatchesJsonStatus(org.springframework.test.web.servlet.MvcResult result,
+                                                     int expectedStatus) throws Exception {
+        int actualHttpStatus = result.getResponse().getStatus();
+        org.junit.jupiter.api.Assertions.assertEquals(expectedStatus, actualHttpStatus);
+
+        String body = result.getResponse().getContentAsString();
+        JsonNode json = objectMapper.readTree(body);
+        // ApiResponse (2xx) no trae "status": solo ApiError lo trae. Cuando está presente, debe
+        // coincidir siempre con el código HTTP real de la respuesta.
+        if (json.has("status") && !json.path("status").isNull()) {
+            org.junit.jupiter.api.Assertions.assertEquals(actualHttpStatus, json.path("status").asInt());
+        }
     }
 
 }
