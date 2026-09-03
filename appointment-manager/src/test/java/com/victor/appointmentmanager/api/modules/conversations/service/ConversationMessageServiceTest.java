@@ -327,6 +327,33 @@ class ConversationMessageServiceTest {
         assertThat(messageCaptor.getValue().getExternalMessageId()).isNull();
     }
 
+    /**
+     * MVP 3 - Fase 2: el overload de 5 argumentos es lo que usa el envío manual
+     * ({@code ConversationManualMessageServiceImpl}) para persistir con senderType HUMAN, sin
+     * duplicar la lógica de metadata/unreadCount que ya valida el resto de esta clase.
+     */
+    @Test
+    void outboundWithHumanSenderTypePersistsWithoutIncrementingUnreadCount() {
+        Conversation existing = existingConversation(10L, BUSINESS_ID, SENDER_PHONE, 8L, 3);
+        when(conversationRepository.findByBusinessIdAndSenderPhone(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.of(existing));
+
+        ConversationMessage saved = service.recordOutbound(BUSINESS_ID, SENDER_PHONE, "wamid.HUMAN1",
+                "Hola, te habla Juan", MessageSenderType.HUMAN);
+
+        assertThat(saved.getSenderType()).isEqualTo(MessageSenderType.HUMAN);
+        assertThat(saved.getDirection()).isEqualTo(MessageDirection.OUTBOUND);
+        assertThat(saved.getMessageType()).isEqualTo(MessageType.TEXT);
+        assertThat(saved.getContent()).isEqualTo("Hola, te habla Juan");
+        assertThat(saved.getCustomerId()).isEqualTo(8L);
+
+        verify(conversationRepository).save(conversationCaptor.capture());
+        Conversation updated = conversationCaptor.getValue();
+        assertThat(updated.getUnreadCount()).isEqualTo(3);
+        assertThat(updated.getLastMessagePreview()).isEqualTo("Hola, te habla Juan");
+        verify(customerRepository, never()).findByBusinessIdAndPhoneAndActiveTrue(any(), any());
+    }
+
     private Conversation existingConversation(Long id, Long businessId, String senderPhone, Long customerId,
                                                int unreadCount) {
         Conversation conversation = new Conversation();

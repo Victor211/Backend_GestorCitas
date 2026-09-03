@@ -79,8 +79,27 @@ public class ConversationMessageService {
         return conversation;
     }
 
+    /** OUTBOUND del bot (respuesta automática). Ver {@link #recordOutbound(Long, String, String, String, MessageSenderType)}. */
     @Transactional
-    public void recordOutbound(Long businessId, String senderPhone, String externalMessageId, String content) {
+    public ConversationMessage recordOutbound(Long businessId, String senderPhone, String externalMessageId,
+                                               String content) {
+        return recordOutbound(businessId, senderPhone, externalMessageId, content, MessageSenderType.BOT);
+    }
+
+    /**
+     * OUTBOUND genérico: {@code senderType} distingue una respuesta automática del bot
+     * ({@link MessageSenderType#BOT}) de un mensaje manual escrito por un operador
+     * ({@link MessageSenderType#HUMAN}, MVP 3 - Fase 2 - ver
+     * {@code ConversationManualMessageServiceImpl}). Ambos comparten exactamente la misma
+     * semántica de persistencia y metadata: nunca incrementan {@code unreadCount} (eso es
+     * exclusivo de {@link #recordInbound}, lo que escribió el cliente).
+     *
+     * @return el {@link ConversationMessage} ya persistido (con id/createdAt), para que el
+     * llamador pueda devolverlo tal cual en la respuesta HTTP sin una consulta aparte.
+     */
+    @Transactional
+    public ConversationMessage recordOutbound(Long businessId, String senderPhone, String externalMessageId,
+                                               String content, MessageSenderType senderType) {
         Conversation conversation = findOrCreateConversation(businessId, senderPhone);
 
         ConversationMessage message = new ConversationMessage();
@@ -89,7 +108,7 @@ public class ConversationMessageService {
         message.setCustomerId(conversation.getCustomerId());
         message.setExternalMessageId(externalMessageId);
         message.setDirection(MessageDirection.OUTBOUND);
-        message.setSenderType(MessageSenderType.BOT);
+        message.setSenderType(senderType);
         message.setMessageType(MessageType.TEXT);
         message.setContent(content);
         conversationMessageRepository.save(message);
@@ -98,6 +117,8 @@ public class ConversationMessageService {
         conversation.setLastMessageAt(Instant.now());
         conversation.setLastMessagePreview(preview(content));
         conversationRepository.save(conversation);
+
+        return message;
     }
 
     /**
