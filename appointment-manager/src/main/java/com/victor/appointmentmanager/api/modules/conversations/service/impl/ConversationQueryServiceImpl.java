@@ -37,9 +37,11 @@ public class ConversationQueryServiceImpl implements ConversationQueryService {
 
     @Override
     @Transactional(readOnly = true)
-    public Page<ConversationSummaryResponse> listConversations(Pageable pageable) {
+    public Page<ConversationSummaryResponse> listConversations(boolean archived, Pageable pageable) {
         Long businessId = currentUserProvider.getCurrentBusinessId();
-        Page<Conversation> conversations = conversationRepository.findByBusinessId(businessId, pageable);
+        Page<Conversation> conversations = archived
+                ? conversationRepository.findByBusinessIdAndArchivedAtIsNotNull(businessId, pageable)
+                : conversationRepository.findByBusinessIdAndArchivedAtIsNull(businessId, pageable);
 
         // Evita N+1: en vez de resolver el Customer conversación por conversación, se hace UNA sola
         // consulta "IN" con los customerId no nulos de toda la página (como mucho, page size + 1

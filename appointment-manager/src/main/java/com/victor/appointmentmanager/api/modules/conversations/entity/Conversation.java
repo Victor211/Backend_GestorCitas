@@ -82,4 +82,15 @@ public class Conversation extends BaseEntity {
     @Column(name = "unread_count", nullable = false)
     private int unreadCount = 0;
 
+    /**
+     * {@code null} = conversación activa (comportamiento por defecto, incluidas todas las filas
+     * previas a esta fase). Un {@link java.time.Instant} = momento en que un operador la archivó
+     * (MVP 3 - Fase 3). Concepto independiente de {@link #status} y {@link #mode}: no reemplaza
+     * ninguno de los dos, y archivar/restaurar nunca los modifica. Un INBOUND nuevo sobre una
+     * conversación archivada la reactiva automáticamente (vuelve a {@code null}) - ver
+     * {@code ConversationMessageService#recordInbound}.
+     */
+    @Column(name = "archived_at")
+    private Instant archivedAt;
+
 }

@@ -87,15 +87,15 @@ class ConversationQueryServiceImplTest {
     void listConversationsUsesCurrentBusinessIdAndPassesThroughPageable() {
         Pageable pageable = PageRequest.of(0, 20);
         Conversation conv = conversation(1L, null);
-        when(conversationRepository.findByBusinessId(BUSINESS_ID, pageable))
+        when(conversationRepository.findByBusinessIdAndArchivedAtIsNull(BUSINESS_ID, pageable))
                 .thenReturn(new PageImpl<>(List.of(conv), pageable, 1));
         when(conversationMapper.toSummaryResponse(eq(conv), isNull()))
                 .thenReturn(new ConversationSummaryResponse());
 
-        Page<ConversationSummaryResponse> result = service.listConversations(pageable);
+        Page<ConversationSummaryResponse> result = service.listConversations(false, pageable);
 
         assertThat(result.getTotalElements()).isEqualTo(1);
-        verify(conversationRepository).findByBusinessId(BUSINESS_ID, pageable);
+        verify(conversationRepository).findByBusinessIdAndArchivedAtIsNull(BUSINESS_ID, pageable);
     }
 
     @Test
@@ -104,7 +104,7 @@ class ConversationQueryServiceImplTest {
         Conversation withCustomer1 = conversation(1L, 8L);
         Conversation withCustomer2 = conversation(2L, 9L);
         Conversation withoutCustomer = conversation(3L, null);
-        when(conversationRepository.findByBusinessId(BUSINESS_ID, pageable)).thenReturn(
+        when(conversationRepository.findByBusinessIdAndArchivedAtIsNull(BUSINESS_ID, pageable)).thenReturn(
                 new PageImpl<>(List.of(withCustomer1, withCustomer2, withoutCustomer), pageable, 3));
 
         Customer customer8 = new Customer();
@@ -114,7 +114,7 @@ class ConversationQueryServiceImplTest {
         when(customerRepository.findAllById(any())).thenReturn(List.of(customer8, customer9));
         when(conversationMapper.toSummaryResponse(any(), any())).thenReturn(new ConversationSummaryResponse());
 
-        service.listConversations(pageable);
+        service.listConversations(false, pageable);
 
         // Una sola consulta "IN" para toda la página, sin importar cuántas conversaciones tengan
         // Customer: nunca N consultas individuales (N+1).
@@ -129,13 +129,28 @@ class ConversationQueryServiceImplTest {
     void listConversationsSkipsCustomerLookupWhenNoneHaveCustomerId() {
         Pageable pageable = PageRequest.of(0, 20);
         Conversation withoutCustomer = conversation(1L, null);
-        when(conversationRepository.findByBusinessId(BUSINESS_ID, pageable))
+        when(conversationRepository.findByBusinessIdAndArchivedAtIsNull(BUSINESS_ID, pageable))
                 .thenReturn(new PageImpl<>(List.of(withoutCustomer), pageable, 1));
         when(conversationMapper.toSummaryResponse(any(), any())).thenReturn(new ConversationSummaryResponse());
 
-        service.listConversations(pageable);
+        service.listConversations(false, pageable);
 
         verify(customerRepository, never()).findAllById(any());
+    }
+
+    @Test
+    void listConversationsWithArchivedTrueQueriesOnlyArchived() {
+        Pageable pageable = PageRequest.of(0, 20);
+        Conversation archived = conversation(1L, null);
+        when(conversationRepository.findByBusinessIdAndArchivedAtIsNotNull(BUSINESS_ID, pageable))
+                .thenReturn(new PageImpl<>(List.of(archived), pageable, 1));
+        when(conversationMapper.toSummaryResponse(any(), any())).thenReturn(new ConversationSummaryResponse());
+
+        Page<ConversationSummaryResponse> result = service.listConversations(true, pageable);
+
+        assertThat(result.getTotalElements()).isEqualTo(1);
+        verify(conversationRepository).findByBusinessIdAndArchivedAtIsNotNull(BUSINESS_ID, pageable);
+        verify(conversationRepository, never()).findByBusinessIdAndArchivedAtIsNull(any(), any());
     }
 
     // ------------------------------------------------------------------

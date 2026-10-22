@@ -21,6 +21,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -48,7 +49,10 @@ public class ConversationHistoryController {
     @GetMapping
     @Operation(summary = "Listar conversaciones del negocio autenticado",
             description = "Paginado, ordenado por lastMessageAt descendente (la más reciente primero) por "
-                    + "defecto. Ejemplo: /api/conversations?page=0&size=20")
+                    + "defecto. Ejemplo: /api/conversations?page=0&size=20. El parámetro archived filtra por "
+                    + "archivedAt: archived=false (por defecto, incluido cuando se omite) trae solo la bandeja "
+                    + "activa; archived=true trae exclusivamente las conversaciones archivadas (ver PUT "
+                    + "/{id}/archive).")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", description = "Listado obtenido correctamente"),
@@ -57,8 +61,9 @@ public class ConversationHistoryController {
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
     public ApiResponse<Page<ConversationSummaryResponse>> findAll(
+            @RequestParam(defaultValue = "false") boolean archived,
             @PageableDefault(sort = "lastMessageAt", direction = Sort.Direction.DESC) Pageable pageable) {
-        return ResponseFactory.success(conversationQueryService.listConversations(pageable));
+        return ResponseFactory.success(conversationQueryService.listConversations(archived, pageable));
     }
 
     @GetMapping("/{id}/messages")

@@ -60,6 +60,12 @@ public class ConversationMessageService {
     public Conversation recordInbound(Long businessId, String senderPhone, String externalMessageId, String content) {
         Conversation conversation = findOrCreateConversation(businessId, senderPhone);
 
+        // MVP 3 - Fase 3: un cliente que vuelve a escribir por WhatsApp reactiva su Conversation
+        // archivada en vez de crear una nueva (uk_conversations_business_sender ya impide duplicar
+        // la fila). Independiente de BOT/HUMAN: el llamador (WhatsAppWebhookServiceImpl) decide
+        // aparte, con el mode ya vigente, si el bot responde o queda en silencio.
+        conversation.setArchivedAt(null);
+
         ConversationMessage message = new ConversationMessage();
         message.setConversationId(conversation.getId());
         message.setBusinessId(businessId);

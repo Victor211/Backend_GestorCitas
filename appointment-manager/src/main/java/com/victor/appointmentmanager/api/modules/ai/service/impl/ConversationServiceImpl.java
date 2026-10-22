@@ -48,6 +48,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -55,6 +56,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -273,6 +275,13 @@ public class ConversationServiceImpl implements ConversationService {
         // coincide, exacto y normalizado, con un único Service activo, se resuelve sin pasar por
         // la IA — antes de que cualquier clasificación de intent (incluido un LIST_SERVICES mal
         // asignado a una respuesta corta) pueda cortar el flujo. Ver matchSingleActiveService.
+        if (!state.hasPendingService() && state.hasOfferedServices()) {
+            Optional<ConversationResponse> numeric = respondToNumericServiceSelection(business, message, state);
+            if (numeric.isPresent()) {
+                return numeric.get();
+            }
+        }
+
         if (!state.hasPendingService()) {
             Optional<Service> directMatch = matchSingleActiveService(business.getId(), message);
             if (directMatch.isPresent()) {
@@ -286,7 +295,7 @@ public class ConversationServiceImpl implements ConversationService {
         ParsedAiReply parsed = askAi(business, state, message);
 
         if (parsed.intent() == ConversationIntent.LIST_SERVICES) {
-            return finish(state, business, replyFormatter.serviceList(activeServices(business.getId())),
+            return finish(state, business, serviceCatalogReply(business.getId(), state),
                     ConversationIntent.LIST_SERVICES, parsed.confidence(), null);
         }
 
@@ -326,6 +335,47 @@ public class ConversationServiceImpl implements ConversationService {
 
         DispatchOutcome outcome = advanceBookingFlow(business, state);
         return finishFromOutcome(state, business, outcome, ConversationIntent.BOOK_APPOINTMENT, parsed.confidence());
+    }
+
+    /**
+     * Selección de servicio por número ("1", "2."), solo mientras hay un catálogo numerado
+     * pendiente de respuesta (ConversationState#offeredServiceIds) y aún no hay servicio elegido.
+     * El número es la posición en el catálogo que se le mostró a ese cliente, no un id de base de
+     * datos. Devuelve vacío si el mensaje no es un entero (sigue el flujo normal, incluida la
+     * selección por nombre). Un entero fuera de rango, o cuyo servicio ya no está activo en este
+     * negocio, vuelve a mostrar el catálogo actualizado sin tocar el resto del borrador.
+     */
+    private Optional<ConversationResponse> respondToNumericServiceSelection(Business business, String message,
+                                                                           ConversationState state) {
+        Matcher matcher = SERVICE_OPTION_NUMBER.matcher(message == null ? "" : message);
+        if (!matcher.matches()) {
+            return Optional.empty();
+        }
+        List<Long> offered = state.offeredServiceIdList();
+        int option = Integer.parseInt(matcher.group(1));
+
+        Optional<Service> chosen = option >= 1 && option <= offered.size()
+                ? serviceRepository.findByIdAndBusinessIdAndActiveTrue(offered.get(option - 1), business.getId())
+                : Optional.empty();
+
+        if (chosen.isEmpty()) {
+            List<Service> current = activeServices(business.getId());
+            state.offerServices(current.stream().map(Service::getId).toList());
+            return Optional.of(finish(state, business, replyFormatter.serviceListAfterInvalidOption(current),
+                    ConversationIntent.BOOK_APPOINTMENT, DETERMINISTIC_CONFIDENCE, null));
+        }
+
+        state.setPendingServiceId(chosen.get().getId());
+        DispatchOutcome outcome = advanceBookingFlow(business, state);
+        return Optional.of(finishFromOutcome(state, business, outcome, ConversationIntent.BOOK_APPOINTMENT,
+                DETERMINISTIC_CONFIDENCE));
+    }
+
+    /** Arma el catálogo numerado y guarda la correspondencia número→serviceId que se mostró. */
+    private String serviceCatalogReply(Long businessId, ConversationState state) {
+        List<Service> services = activeServices(businessId);
+        state.offerServices(services.stream().map(Service::getId).toList());
+        return replyFormatter.serviceList(services);
     }
 
     private ConversationResponse respondToPureGreeting(Business business, ConversationState state, ParsedAiReply parsed) {
@@ -500,9 +550,12 @@ public class ConversationServiceImpl implements ConversationService {
     private DispatchOutcome advanceBookingFlow(Business business, ConversationState state) {
         state.setStage(ConversationStage.COLLECTING);
 
+        if (state.hasPendingService()) {
+            state.clearOfferedServices();
+        }
         if (!state.hasPendingService()) {
             // Mostrar el catálogo real (con precio) en vez de una pregunta genérica.
-            return DispatchOutcome.reply(replyFormatter.serviceList(activeServices(business.getId())));
+            return DispatchOutcome.reply(serviceCatalogReply(business.getId(), state));
         }
         if (state.getPendingStartAt() == null) {
             // Sin fecha/hora todavía no tiene sentido preguntar profesional.
@@ -697,6 +750,8 @@ public class ConversationServiceImpl implements ConversationService {
         return null;
     }
 
+    /** Entero solo (opcionalmente con "." o ")" final), p. ej. "2", "2.", "2)". */
+    private static final Pattern SERVICE_OPTION_NUMBER = Pattern.compile("^\\s*(\\d{1,6})\\s*[.)]?\\s*$");
     private static final Pattern SERVICE_MATCH_VERB_LEAD_IN = Pattern.compile(
             "(?i)^(?:quiero|prefiero|quisiera|dame)\\s+");
     private static final Pattern SERVICE_MATCH_ARTICLE_LEAD_IN = Pattern.compile("(?i)^(?:el|la)\\s+");
@@ -1047,9 +1102,16 @@ public class ConversationServiceImpl implements ConversationService {
                 .trim();
     }
 
+    /**
+     * Servicios activos en orden determinístico (nombre normalizado, luego id): la base no
+     * garantiza ningún orden, y la numeración del catálogo debe ser estable.
+     */
     private List<Service> activeServices(Long businessId) {
         return serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
-                businessId, "", Pageable.unpaged()).getContent();
+                        businessId, "", Pageable.unpaged()).getContent().stream()
+                .sorted(Comparator.comparing((Service service) -> normalizeForNameMatch(service.getName()))
+                        .thenComparing(Service::getId))
+                .toList();
     }
 
     private String buildBusinessContext(Business business) {

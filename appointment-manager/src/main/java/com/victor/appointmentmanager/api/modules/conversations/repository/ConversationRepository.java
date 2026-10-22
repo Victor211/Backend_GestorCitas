@@ -11,7 +11,9 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
 
     Optional<Conversation> findByBusinessIdAndSenderPhone(Long businessId, String senderPhone);
 
-    Page<Conversation> findByBusinessId(Long businessId, Pageable pageable);
+    Page<Conversation> findByBusinessIdAndArchivedAtIsNull(Long businessId, Pageable pageable);
+
+    Page<Conversation> findByBusinessIdAndArchivedAtIsNotNull(Long businessId, Pageable pageable);
 
     Optional<Conversation> findByIdAndBusinessId(Long id, Long businessId);
 

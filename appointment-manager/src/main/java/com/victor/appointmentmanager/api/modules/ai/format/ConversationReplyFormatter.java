@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 /**
  * Único responsable de redactar el texto final que ve el cliente por WhatsApp, a partir de datos
@@ -62,14 +63,30 @@ public class ConversationReplyFormatter {
                 + "¿Te ayudo a reservar un turno o necesitás información sobre nuestros servicios?";
     }
 
+    /**
+     * Catálogo numerado consecutivamente desde 1 en el orden recibido. Quien llama es responsable
+     * de guardar esa misma lista ordenada (ConversationState#offerServices): el número que ve el
+     * cliente es la posición en ella, nunca un id de base de datos.
+     */
     public String serviceList(List<Service> services) {
+        return serviceList(services, "Claro 😊 Estos son nuestros servicios:");
+    }
+
+    /** Igual que {@link #serviceList(List)} pero tras una opción numérica que ya no es válida. */
+    public String serviceListAfterInvalidOption(List<Service> services) {
+        return serviceList(services, "Esa opción no está disponible. Estos son nuestros servicios:");
+    }
+
+    private String serviceList(List<Service> services, String intro) {
         if (services.isEmpty()) {
             return NO_SERVICES_REPLY;
         }
-        String lines = services.stream()
-                .map(service -> "• " + service.getName() + " — " + guaraniAmountFormatter.format(service.getPrice()))
+        String lines = IntStream.range(0, services.size())
+                .mapToObj(i -> (i + 1) + ". " + services.get(i).getName() + " — "
+                        + guaraniAmountFormatter.format(services.get(i).getPrice()))
                 .collect(Collectors.joining("\n"));
-        return "Claro 😊 Estos son nuestros servicios:\n\n" + lines + "\n\n¿Cuál te gustaría reservar?";
+        return intro + "\n\n" + lines
+                + "\n\n¿Cuál te gustaría reservar?\nRespondé con el número de la opción o el nombre del servicio.";
     }
 
     public String confirmationQuestion(Business business, Service service, Employee employee, Instant startAt) {

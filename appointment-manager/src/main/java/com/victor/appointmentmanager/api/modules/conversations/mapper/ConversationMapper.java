@@ -1,5 +1,6 @@
 package com.victor.appointmentmanager.api.modules.conversations.mapper;
 
+import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationArchiveResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationMessageResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationModeResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationReadResponse;
@@ -30,6 +31,7 @@ public interface ConversationMapper {
     @Mapping(target = "lastMessageAt", source = "conversation.lastMessageAt")
     @Mapping(target = "lastMessagePreview", source = "conversation.lastMessagePreview")
     @Mapping(target = "unreadCount", source = "conversation.unreadCount")
+    @Mapping(target = "archivedAt", source = "conversation.archivedAt")
     ConversationSummaryResponse toSummaryResponse(Conversation conversation, Customer customer);
 
     ConversationMessageResponse toMessageResponse(ConversationMessage message);
@@ -37,6 +39,8 @@ public interface ConversationMapper {
     ConversationReadResponse toReadResponse(Conversation conversation);
 
     ConversationModeResponse toModeResponse(Conversation conversation);
+
+    ConversationArchiveResponse toArchiveResponse(Conversation conversation);
 
     @Named("toCustomerFullName")
     default String toCustomerFullName(Customer customer) {

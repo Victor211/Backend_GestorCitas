@@ -15,7 +15,12 @@ import org.springframework.data.domain.Pageable;
  */
 public interface ConversationQueryService {
 
-    Page<ConversationSummaryResponse> listConversations(Pageable pageable);
+    /**
+     * @param archived {@code false} (comportamiento por defecto, incluido cuando el request no
+     *                 manda el parámetro) devuelve solo conversaciones con {@code archivedAt IS
+     *                 NULL}; {@code true} devuelve exclusivamente las archivadas.
+     */
+    Page<ConversationSummaryResponse> listConversations(boolean archived, Pageable pageable);
 
     Page<ConversationMessageResponse> listMessages(Long conversationId, Pageable pageable);
 

@@ -1,5 +1,6 @@
 package com.victor.appointmentmanager.api.modules.conversations.mapper;
 
+import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationArchiveResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationMessageResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationModeResponse;
 import com.victor.appointmentmanager.api.modules.conversations.dto.response.ConversationReadResponse;
@@ -58,6 +59,18 @@ class ConversationMapperTest {
         assertThat(response.getMode()).isEqualTo(ConversationMode.BOT);
         assertThat(response.getLastMessagePreview()).isEqualTo("Perfecto, tu turno quedó reservado...");
         assertThat(response.getUnreadCount()).isEqualTo(3);
+        assertThat(response.getArchivedAt()).isNull();
+    }
+
+    @Test
+    void mapsArchivedAtWhenConversationIsArchived() {
+        Conversation conversation = buildConversation();
+        Instant archivedAt = Instant.parse("2026-09-04T10:00:00Z");
+        conversation.setArchivedAt(archivedAt);
+
+        ConversationSummaryResponse response = mapper.toSummaryResponse(conversation, null);
+
+        assertThat(response.getArchivedAt()).isEqualTo(archivedAt);
     }
 
     @Test
@@ -126,6 +139,18 @@ class ConversationMapperTest {
 
         assertThat(response.getId()).isEqualTo(15L);
         assertThat(response.getMode()).isEqualTo(ConversationMode.HUMAN);
+    }
+
+    @Test
+    void mapsArchiveResponse() {
+        Conversation conversation = buildConversation();
+        Instant archivedAt = Instant.parse("2026-09-04T10:00:00Z");
+        conversation.setArchivedAt(archivedAt);
+
+        ConversationArchiveResponse response = mapper.toArchiveResponse(conversation);
+
+        assertThat(response.getId()).isEqualTo(15L);
+        assertThat(response.getArchivedAt()).isEqualTo(archivedAt);
     }
 
 }

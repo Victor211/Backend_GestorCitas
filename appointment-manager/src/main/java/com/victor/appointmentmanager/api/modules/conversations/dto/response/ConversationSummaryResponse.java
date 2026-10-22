@@ -29,5 +29,6 @@ public class ConversationSummaryResponse {
     private Instant lastMessageAt;
     private String lastMessagePreview;
     private int unreadCount;
+    private Instant archivedAt;
 
 }

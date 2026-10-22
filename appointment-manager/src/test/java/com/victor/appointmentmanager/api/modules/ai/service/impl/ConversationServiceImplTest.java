@@ -332,8 +332,8 @@ class ConversationServiceImplTest {
                 1L, "+595981000001", "¿Qué servicios ofrecen?");
 
         assertThat(result.getIntent()).isEqualTo(ConversationIntent.LIST_SERVICES);
-        assertThat(result.getReply()).contains("• Corte Premium — Gs. 65.000");
-        assertThat(result.getReply()).contains("• Coloración — Gs. 150.000");
+        assertThat(result.getReply()).contains("2. Corte Premium — Gs. 65.000");
+        assertThat(result.getReply()).contains("1. Coloración — Gs. 150.000");
         assertThat(result.getReply()).doesNotContain("$");
     }
 
@@ -1094,8 +1094,8 @@ class ConversationServiceImplTest {
         ConversationResponse result = conversationService.processChannelConversation(
                 1L, phone, "Quiero reservar un turno");
 
-        assertThat(result.getReply()).contains("• Corte Premium — Gs. 65.000");
-        assertThat(result.getReply()).contains("• Corte Barba — Gs. 45.000");
+        assertThat(result.getReply()).contains("2. Corte Premium — Gs. 65.000");
+        assertThat(result.getReply()).contains("1. Corte Barba — Gs. 45.000");
         assertThat(result.getReply()).contains("¿Cuál te gustaría reservar?");
         assertThat(result.getReply()).doesNotContain("profesional");
     }
@@ -1127,13 +1127,13 @@ class ConversationServiceImplTest {
         stubAi("Me gustaría reservar un turno", "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa");
         ConversationResponse first = conversationService.processChannelConversation(
                 1L, phone, "Me gustaría reservar un turno");
-        assertThat(first.getReply()).contains("• Corte Premium — Gs. 65.000");
-        assertThat(first.getReply()).contains("• Corte Barba — Gs. 45.000");
+        assertThat(first.getReply()).contains("2. Corte Premium — Gs. 65.000");
+        assertThat(first.getReply()).contains("1. Corte Barba — Gs. 45.000");
 
         ConversationResponse second = conversationService.processChannelConversation(1L, phone, "Corte premium");
 
-        assertThat(second.getReply()).doesNotContain("• Corte Premium");
-        assertThat(second.getReply()).doesNotContain("• Corte Barba");
+        assertThat(second.getReply()).doesNotContain("Corte Premium — Gs.");
+        assertThat(second.getReply()).doesNotContain("Corte Barba — Gs.");
         assertThat(second.getReply()).doesNotContain("¿Cuál te gustaría reservar?");
         assertThat(second.getReply()).contains("¿Para cuándo te gustaría el turno?");
         verify(aiProvider, never()).generateResponse(anyString(), eq("Corte premium"));
@@ -1174,7 +1174,7 @@ class ConversationServiceImplTest {
         ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Corte barba");
 
         assertThat(result.getReply()).doesNotContain("¿Cuál te gustaría reservar?");
-        assertThat(result.getReply()).doesNotContain("• Corte Premium");
+        assertThat(result.getReply()).doesNotContain("Corte Premium — Gs.");
         verify(aiProvider, never()).generateResponse(anyString(), eq("Corte barba"));
 
         ConversationState state = statesByKey.get(key(1L, phone));
@@ -1700,7 +1700,7 @@ class ConversationServiceImplTest {
                 1L, phone, "¿Para cuándo tienen disponible y qué horarios?");
 
         assertThat(result.getReply()).doesNotContain("¿Cuál te gustaría reservar?");
-        assertThat(result.getReply()).doesNotContain("• Corte Premium");
+        assertThat(result.getReply()).doesNotContain("Corte Premium — Gs.");
         assertThat(result.getReply()).contains("•");
         assertThat(result.getReply()).contains("10:00");
         assertThat(result.getReply()).contains("11:00");
@@ -1931,6 +1931,247 @@ class ConversationServiceImplTest {
         verify(appointmentService, never()).findAvailableSlots(anyLong(), anyLong(), isNull(), any(LocalDate.class), anyInt());
         verify(appointmentService, org.mockito.Mockito.atLeastOnce())
                 .findAvailableSlots(eq(1L), eq(3L), eq(6L), any(LocalDate.class), anyInt());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Selección de servicio por número: la numeración es la posición en el catálogo mostrado
+    // (orden determinístico por nombre), se resuelve en Java y se conserva en ConversationState.
+    // ---------------------------------------------------------------------------------------
+
+    private static final String BOOK_INTENT = "INTENT: BOOK_APPOINTMENT\nCONFIDENCE: 0.6\nREPLY: no importa";
+
+    private void stubCatalog(Long businessId, Service... services) {
+        lenient().when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(businessId), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(services)));
+        for (Service s : services) {
+            lenient().when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(s.getId(), businessId))
+                    .thenReturn(Optional.of(s));
+        }
+    }
+
+    /** El cliente pide reservar y recibe el catálogo numerado (única llamada a la IA del flujo). */
+    private ConversationResponse showCatalog(String phone) {
+        stubAi("Quiero reservar", BOOK_INTENT);
+        return conversationService.processChannelConversation(1L, phone, "Quiero reservar");
+    }
+
+    @Test
+    void catalogIsNumberedWithPricesInDeterministicOrderRegardlessOfRepositoryOrder() {
+        String phone = "+595981555001";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        stubCatalog(1L, premium, barba);
+
+        String reply = showCatalog(phone).getReply();
+
+        assertThat(reply).contains("Claro 😊 Estos son nuestros servicios:");
+        assertThat(reply).contains("1. Corte Barba — Gs. 45.000\n2. Corte Premium — Gs. 65.000");
+        assertThat(reply).contains("¿Cuál te gustaría reservar?\nRespondé con el número de la opción o el nombre del servicio.");
+
+        // Mismo catálogo devuelto en otro orden por la base => misma numeración.
+        String otherPhone = "+595981555002";
+        existingCustomer(otherPhone, "Ana");
+        stubCatalog(1L, barba, premium);
+        String reply2 = conversationService.processChannelConversation(1L, otherPhone, "Quiero reservar").getReply();
+        assertThat(reply2).contains("1. Corte Barba — Gs. 45.000\n2. Corte Premium — Gs. 65.000");
+    }
+
+    @Test
+    void numericReplySelectsServiceByShownPositionWithoutCallingAi() {
+        String phone = "+595981555003";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        stubCatalog(1L, premium, barba);
+        showCatalog(phone);
+
+        ConversationResponse first = conversationService.processChannelConversation(1L, phone, "1");
+
+        assertThat(first.getReply()).contains("¿Para cuándo te gustaría el turno?");
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getPendingServiceId()).isEqualTo(6L);
+        assertThat(state.hasOfferedServices()).isFalse();
+        verify(aiProvider, never()).generateResponse(anyString(), eq("1"));
+
+        String otherPhone = "+595981555004";
+        existingCustomer(otherPhone, "Ana");
+        conversationService.processChannelConversation(1L, otherPhone, "Quiero reservar");
+        conversationService.processChannelConversation(1L, otherPhone, "2.");
+        assertThat(statesByKey.get(key(1L, otherPhone)).getPendingServiceId()).isEqualTo(4L);
+        verify(aiProvider, never()).generateResponse(anyString(), eq("2."));
+    }
+
+    @Test
+    void selectionByNameStillWorksWhileNumberedCatalogIsPending() {
+        String phone = "+595981555005";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        stubCatalog(1L, premium, barba);
+        showCatalog(phone);
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, phone, "Corte premium");
+
+        assertThat(result.getReply()).contains("¿Para cuándo te gustaría el turno?");
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getPendingServiceId()).isEqualTo(4L);
+        assertThat(state.hasOfferedServices()).isFalse();
+        verify(aiProvider, never()).generateResponse(anyString(), eq("Corte premium"));
+    }
+
+    @Test
+    void nonexistentOptionRepliesBrieflyAndShowsCatalogAgainKeepingDraft() {
+        String phone = "+595981555006";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        stubCatalog(1L, premium, barba);
+        showCatalog(phone);
+        ConversationState state = statesByKey.get(key(1L, phone));
+        state.setPendingEmployeeId(3L);
+
+        for (String invalid : List.of("5", "0")) {
+            ConversationResponse result = conversationService.processChannelConversation(1L, phone, invalid);
+            assertThat(result.getReply()).contains("Esa opción no está disponible.");
+            assertThat(result.getReply()).contains("1. Corte Barba — Gs. 45.000\n2. Corte Premium — Gs. 65.000");
+            verify(aiProvider, never()).generateResponse(anyString(), eq(invalid));
+        }
+        ConversationState after = statesByKey.get(key(1L, phone));
+        assertThat(after.getPendingServiceId()).isNull();
+        assertThat(after.getPendingEmployeeId()).isEqualTo(3L);
+        assertThat(after.hasOfferedServices()).isTrue();
+    }
+
+    @Test
+    void numberOutsideServiceSelectionContextDoesNotSelectAService() {
+        String phone = "+595981555007";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        stubCatalog(1L, premium, barba);
+
+        // Sin catálogo mostrado: el "1" va a la IA como cualquier otro mensaje.
+        stubAi("1", "INTENT: UNKNOWN\nCONFIDENCE: 0.3\nREPLY: ¿Me contás un poco más?");
+        ConversationResponse noContext = conversationService.processChannelConversation(1L, phone, "1");
+        assertThat(noContext.getReply()).contains("¿Me contás un poco más?");
+        assertThat(statesByKey.get(key(1L, phone)).getPendingServiceId()).isNull();
+        verify(aiProvider).generateResponse(anyString(), eq("1"));
+
+        // Con servicio ya elegido el catálogo deja de estar pendiente: "2" no lo cambia.
+        stubAi("Quiero reservar", BOOK_INTENT);
+        String otherPhone = "+595981555008";
+        existingCustomer(otherPhone, "Ana");
+        conversationService.processChannelConversation(1L, otherPhone, "Quiero reservar");
+        conversationService.processChannelConversation(1L, otherPhone, "1");
+        stubAi("2", "INTENT: UNKNOWN\nCONFIDENCE: 0.3\nREPLY: ¿Para qué día?");
+        conversationService.processChannelConversation(1L, otherPhone, "2");
+        assertThat(statesByKey.get(key(1L, otherPhone)).getPendingServiceId()).isEqualTo(6L);
+        verify(aiProvider).generateResponse(anyString(), eq("2"));
+    }
+
+    @Test
+    void optionStaysBoundToShownServiceEvenIfCatalogChangedButIsRefusedIfServiceWasDeactivated() {
+        String phone = "+595981555009";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        stubCatalog(1L, premium, barba);
+        showCatalog(phone);
+
+        // Se agrega "Alisado": ahora sería la opción 1 si se recalculara, pero el cliente vio otra cosa.
+        Service alisado = service(9L, "Alisado", new BigDecimal("90000"));
+        stubCatalog(1L, premium, barba, alisado);
+        conversationService.processChannelConversation(1L, phone, "1");
+        assertThat(statesByKey.get(key(1L, phone)).getPendingServiceId()).isEqualTo(6L);
+
+        // Otro cliente: el servicio ofrecido como opción 1 se desactiva antes de responder.
+        String otherPhone = "+595981555010";
+        existingCustomer(otherPhone, "Ana");
+        stubCatalog(1L, premium, barba);
+        conversationService.processChannelConversation(1L, otherPhone, "Quiero reservar");
+        when(serviceRepository.findByIdAndBusinessIdAndActiveTrue(6L, 1L)).thenReturn(Optional.empty());
+        when(serviceRepository.findByBusinessIdAndNameContainingIgnoreCaseAndActiveTrue(
+                        eq(1L), eq(""), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(premium)));
+
+        ConversationResponse result = conversationService.processChannelConversation(1L, otherPhone, "1");
+
+        assertThat(result.getReply()).contains("Esa opción no está disponible.");
+        assertThat(result.getReply()).contains("1. Corte Premium — Gs. 65.000");
+        assertThat(result.getReply()).doesNotContain("Corte Barba");
+        ConversationState state = statesByKey.get(key(1L, otherPhone));
+        assertThat(state.getPendingServiceId()).isNull();
+        // La numeración vuelve a quedar guardada para la lista actualizada.
+        assertThat(state.offeredServiceIdList()).containsExactly(4L);
+    }
+
+    @Test
+    void numericSelectionIsIsolatedBetweenBusinesses() {
+        String phone = "+595981555011";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        stubCatalog(1L, premium, barba);
+        showCatalog(phone);
+
+        Business other = new Business();
+        other.setId(2L);
+        other.setName("Otra Barbería");
+        other.setTimezone("America/Asuncion");
+        lenient().when(businessRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(other));
+        Service foreign = service(20L, "Afeitado", new BigDecimal("30000"));
+        foreign.setBusiness(other);
+        stubCatalog(2L, foreign);
+
+        // Mismo teléfono en otro negocio: no hay catálogo pendiente allí, el "1" no se interpreta.
+        stubAi("1", "INTENT: UNKNOWN\nCONFIDENCE: 0.3\nREPLY: ¿Me contás más?");
+        conversationService.processChannelConversation(2L, phone, "1");
+
+        assertThat(statesByKey.get(key(2L, phone)).getPendingServiceId()).isNull();
+        verify(serviceRepository, never()).findByIdAndBusinessIdAndActiveTrue(eq(6L), eq(2L));
+        verify(serviceRepository, never()).findByIdAndBusinessIdAndActiveTrue(eq(20L), eq(1L));
+        // El estado del negocio 1 sigue intacto.
+        assertThat(statesByKey.get(key(1L, phone)).offeredServiceIdList()).containsExactly(6L, 4L);
+    }
+
+    @Test
+    void fullBookingCompletesUsingNumericServiceSelection() {
+        String phone = "+595981555012";
+        existingCustomer(phone, "Cristian");
+        Service premium = service(4L, "Corte Premium", new BigDecimal("65000"));
+        Service barba = service(6L, "Corte Barba", new BigDecimal("45000"));
+        Employee juan = employee(3L, "Juan", "Gómez", barba);
+        stubCatalog(1L, premium, barba);
+        stubEmployeeListing(juan);
+        showCatalog(phone);
+
+        conversationService.processChannelConversation(1L, phone, "1");
+
+        stubAi("mañana a las 14", "INTENT: BOOK_APPOINTMENT\nSTART_AT: mañana a las 14\nCONFIDENCE: 0.9\n"
+                + "REPLY: no importa");
+        ConversationResponse proposal = conversationService.processChannelConversation(1L, phone, "mañana a las 14");
+        assertThat(proposal.getReply()).contains("Corte Barba").contains("¿Confirmás?");
+
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(901L);
+        response.setServiceName("Corte Barba");
+        response.setEmployeeName("Juan Gómez");
+        response.setCustomerName("Cristian");
+        response.setStartAt(Instant.now().plus(1, ChronoUnit.DAYS));
+        when(appointmentService.create(eq(1L), any())).thenReturn(response);
+
+        ConversationResponse confirmed = conversationService.processChannelConversation(1L, phone, "sí");
+
+        assertThat(confirmed.getAppointmentId()).isEqualTo(901L);
+        ArgumentCaptor<CreateAppointmentRequest> captor = ArgumentCaptor.forClass(CreateAppointmentRequest.class);
+        verify(appointmentService).create(eq(1L), captor.capture());
+        assertThat(captor.getValue().getServiceId()).isEqualTo(6L);
+        assertThat(captor.getValue().getEmployeeId()).isEqualTo(3L);
+        // "1" y "sí" no llegaron a la IA.
+        verify(aiProvider, never()).generateResponse(anyString(), eq("1"));
+        verify(aiProvider, never()).generateResponse(anyString(), eq("sí"));
     }
 
 }

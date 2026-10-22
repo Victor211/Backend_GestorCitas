@@ -272,6 +272,65 @@ class ConversationMessageServiceTest {
         assertThat(result.getLastMessagePreview()).isEqualTo("Hola");
     }
 
+    /** MVP 3 - Fase 3: ver Javadoc de {@code Conversation.archivedAt}. */
+    @Test
+    void inboundReactivatesArchivedConversationInBotMode() {
+        Conversation existing = existingConversation(10L, BUSINESS_ID, SENDER_PHONE, null, 0);
+        existing.setArchivedAt(java.time.Instant.parse("2026-09-01T00:00:00Z"));
+        when(conversationRepository.findByBusinessIdAndSenderPhone(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.of(existing));
+        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.empty());
+
+        Conversation result = service.recordInbound(BUSINESS_ID, SENDER_PHONE, "wamid.1", "Hola de nuevo");
+
+        assertThat(result.getArchivedAt()).isNull();
+        assertThat(result.getId()).isEqualTo(10L);
+        verify(conversationRepository, times(1)).save(eq(existing));
+    }
+
+    @Test
+    void inboundReactivatesArchivedConversationInHumanModeWithoutChangingMode() {
+        Conversation existing = existingConversation(10L, BUSINESS_ID, SENDER_PHONE, null, 0);
+        existing.setArchivedAt(java.time.Instant.parse("2026-09-01T00:00:00Z"));
+        existing.setMode(ConversationMode.HUMAN);
+        when(conversationRepository.findByBusinessIdAndSenderPhone(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.of(existing));
+        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.empty());
+
+        Conversation result = service.recordInbound(BUSINESS_ID, SENDER_PHONE, "wamid.1", "¿Sigues ahí?");
+
+        assertThat(result.getArchivedAt()).isNull();
+        assertThat(result.getMode()).isEqualTo(ConversationMode.HUMAN);
+        assertThat(result.getUnreadCount()).isEqualTo(1);
+    }
+
+    @Test
+    void inboundOnActiveConversationDoesNotTouchArchivedAt() {
+        Conversation existing = existingConversation(10L, BUSINESS_ID, SENDER_PHONE, null, 0);
+        when(conversationRepository.findByBusinessIdAndSenderPhone(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.of(existing));
+        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.empty());
+
+        Conversation result = service.recordInbound(BUSINESS_ID, SENDER_PHONE, "wamid.1", "Hola");
+
+        assertThat(result.getArchivedAt()).isNull();
+    }
+
+    @Test
+    void newConversationStartsWithArchivedAtNull() {
+        when(conversationRepository.findByBusinessIdAndSenderPhone(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.empty());
+        when(customerRepository.findByBusinessIdAndPhoneAndActiveTrue(BUSINESS_ID, SENDER_PHONE))
+                .thenReturn(Optional.empty());
+
+        Conversation result = service.recordInbound(BUSINESS_ID, SENDER_PHONE, "wamid.1", "Hola");
+
+        assertThat(result.getArchivedAt()).isNull();
+    }
+
     // ------------------------------------------------------------------
     // OUTBOUND
     // ------------------------------------------------------------------

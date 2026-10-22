@@ -15,6 +15,9 @@ import lombok.Setter;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Memoria conversacional mínima por (business, customerPhone): qué datos de una reserva ya se
@@ -77,6 +80,16 @@ public class ConversationState extends BaseEntity {
     private String lastReferencedEmployeeName;
 
     /**
+     * Ids reales de los Services tal como se numeraron en el último catálogo mostrado al cliente,
+     * en orden (la posición 1 es el primer id), separados por coma. Es la correspondencia entre
+     * "respondé con el número" y el servicio real: se persiste porque cada mensaje es una
+     * request independiente y el catálogo puede cambiar entre el listado y la respuesta. No nulo
+     * solo mientras hay una selección de servicio pendiente.
+     */
+    @Column(name = "offered_service_ids", length = 1000)
+    private String offeredServiceIds;
+
+    /**
      * Marca transitoria (no persistida) que {@code ConversationStateStore} activa cuando el
      * estado recuperado estaba en {@code AWAITING_CONFIRMATION} o {@code AWAITING_CUSTOMER_NAME}
      * pero venció por inactividad. Le permite al orquestador responder "esa propuesta ya venció"
@@ -102,7 +115,28 @@ public class ConversationState extends BaseEntity {
         return pendingEmployeeId != null;
     }
 
+    public boolean hasOfferedServices() {
+        return offeredServiceIds != null && !offeredServiceIds.isBlank();
+    }
+
+    public List<Long> offeredServiceIdList() {
+        if (!hasOfferedServices()) {
+            return List.of();
+        }
+        return Arrays.stream(offeredServiceIds.split(",")).map(String::trim).map(Long::valueOf).toList();
+    }
+
+    public void offerServices(List<Long> serviceIds) {
+        this.offeredServiceIds = serviceIds.isEmpty() ? null
+                : serviceIds.stream().map(String::valueOf).collect(Collectors.joining(","));
+    }
+
+    public void clearOfferedServices() {
+        this.offeredServiceIds = null;
+    }
+
     public void clearBookingDraft() {
+        this.offeredServiceIds = null;
         this.pendingServiceId = null;
         this.pendingEmployeeId = null;
         this.pendingDate = null;
