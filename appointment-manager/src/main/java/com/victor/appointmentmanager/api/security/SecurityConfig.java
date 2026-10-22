@@ -7,6 +7,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
 import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -17,6 +18,7 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 import org.springframework.web.cors.CorsConfigurationSource;
 
 @Configuration
+@EnableMethodSecurity
 @RequiredArgsConstructor
 public class SecurityConfig {
 
@@ -27,6 +29,20 @@ public class SecurityConfig {
             "/swagger-ui/**",
             "/swagger-ui.html",
             "/v3/api-docs/**"
+    };
+
+    // Módulos operativos: OWNER y ADMIN. STAFF no tiene ningún permiso operativo definido todavía
+    // (decisión de producto pendiente), por lo que queda denegado en todos ellos.
+    private static final String[] OPERATIONAL_ENDPOINTS = {
+            "/api/appointments/**",
+            "/api/customers/**",
+            "/api/employees/**",
+            "/api/schedules/**",
+            "/api/services/**",
+            "/api/dashboard/**",
+            "/api/conversations/**",
+            "/api/ai/**",
+            "/api/settings/business"
     };
 
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
@@ -61,7 +77,13 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                         .requestMatchers(PUBLIC_ENDPOINTS).permitAll()
-                        .anyRequest().authenticated())
+                        .requestMatchers("/api/auth/me").authenticated()
+                        .requestMatchers("/api/users/**").hasRole("OWNER")
+                        // La configuración del negocio (nombre, zona horaria) solo la modifica el OWNER.
+                        .requestMatchers(HttpMethod.PUT, "/api/settings/business").hasRole("OWNER")
+                        .requestMatchers(OPERATIONAL_ENDPOINTS).hasAnyRole("OWNER", "ADMIN")
+                        // Denegar por defecto: todo endpoint nuevo es solo OWNER hasta clasificarlo aquí.
+                        .anyRequest().hasRole("OWNER"))
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint(authenticationEntryPoint)
                         .accessDeniedHandler(accessDeniedHandler))

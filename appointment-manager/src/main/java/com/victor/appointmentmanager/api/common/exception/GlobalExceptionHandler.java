@@ -3,6 +3,7 @@ package com.victor.appointmentmanager.api.common.exception;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -23,6 +24,13 @@ public class GlobalExceptionHandler {
                 .toList();
 
         return buildResponse(HttpStatus.BAD_REQUEST, "Error de validación", errors, request);
+    }
+
+    // JSON malformado o valor de enum desconocido (p. ej. un role inexistente): error del cliente, no 500.
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiError> handleMessageNotReadable(HttpMessageNotReadableException ex,
+                                                               HttpServletRequest request) {
+        return buildResponse(HttpStatus.BAD_REQUEST, "El cuerpo de la solicitud es inválido", request);
     }
 
     @ExceptionHandler(ResourceNotFoundException.class)

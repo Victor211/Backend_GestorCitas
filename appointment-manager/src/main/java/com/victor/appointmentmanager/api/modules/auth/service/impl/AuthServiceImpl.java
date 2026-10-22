@@ -1,6 +1,7 @@
 package com.victor.appointmentmanager.api.modules.auth.service.impl;
 
 import com.victor.appointmentmanager.api.common.exception.BusinessException;
+import com.victor.appointmentmanager.api.common.util.StringNormalizer;
 import com.victor.appointmentmanager.api.modules.auth.dto.request.LoginRequest;
 import com.victor.appointmentmanager.api.modules.auth.dto.request.RegisterRequest;
 import com.victor.appointmentmanager.api.modules.auth.dto.response.AuthResponse;
@@ -29,7 +30,6 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.time.DateTimeException;
 import java.time.ZoneId;
-import java.util.Locale;
 
 @Service
 @RequiredArgsConstructor
@@ -126,7 +126,7 @@ public class AuthServiceImpl implements AuthService {
     }
 
     private String normalizeEmail(String email) {
-        return email.toLowerCase(Locale.ROOT).trim();
+        return StringNormalizer.normalizeEmail(email);
     }
 
     private AuthResponse buildAuthResponse(String token, User user, Business business) {
