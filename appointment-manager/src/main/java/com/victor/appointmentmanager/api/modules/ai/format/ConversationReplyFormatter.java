@@ -3,11 +3,13 @@ package com.victor.appointmentmanager.api.modules.ai.format;
 import com.victor.appointmentmanager.api.modules.appointments.dto.response.AppointmentResponse;
 import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityReason;
 import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
+import com.victor.appointmentmanager.api.modules.schedule.entity.Schedule;
 import com.victor.appointmentmanager.api.modules.services.entity.Service;
 import com.victor.appointmentmanager.api.shared.entity.Business;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
+import java.time.DayOfWeek;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -61,6 +63,113 @@ public class ConversationReplyFormatter {
     public String pureGreeting(Business business) {
         return greetingPrefix(business)
                 + "¿Te ayudo a reservar un turno o necesitás información sobre nuestros servicios?";
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Menú principal (GS-BOT-003). Las opciones 1..4 se resuelven en el orquestador, en Java.
+    // ---------------------------------------------------------------------------------------
+
+    private static final String MENU_OPTIONS = "¿En qué puedo ayudarte?\n\n"
+            + "1. 📅 Reservar un turno\n"
+            + "2. ❌ Cancelar un turno\n"
+            + "3. 🔄 Cambiar un turno\n"
+            + "4. ℹ️ Información del negocio\n\n"
+            + "Respondé con el número de la opción o escribí lo que necesitás.";
+
+    /** Bienvenida con el nombre real del negocio y el menú principal. */
+    public String welcomeMenu(Business business) {
+        return "Hola 👋 Soy el asistente virtual de " + business.getName() + ".\n\n" + MENU_OPTIONS;
+    }
+
+    /** Solo las opciones (sin repetir la presentación), para el comando "menú" o un saludo repetido. */
+    public String menuOptions() {
+        return MENU_OPTIONS;
+    }
+
+    public String invalidMenuOption() {
+        return "Esa opción no es válida.\n\n" + MENU_OPTIONS;
+    }
+
+    /**
+     * Información pública del negocio, solo con datos configurados (nombre, dirección, teléfono y
+     * horarios de atención de los empleados activos); lo que falta se omite o se indica como no
+     * disponible. Nunca incluye ids, email, ni datos de integración.
+     */
+    public String businessInfo(Business business, List<Schedule> schedules) {
+        List<String> lines = new ArrayList<>();
+        lines.add("ℹ️ " + business.getName());
+        if (business.getAddress() != null && !business.getAddress().isBlank()) {
+            lines.add("📍 Dirección: " + business.getAddress().trim());
+        }
+        if (business.getPhone() != null && !business.getPhone().isBlank()) {
+            lines.add("📞 Teléfono: " + business.getPhone().trim());
+        }
+        List<String> hours = openingHoursLines(schedules);
+        lines.add(hours.isEmpty()
+                ? "🕒 Horarios de atención: no disponibles por el momento."
+                : "🕒 Horarios de atención:\n" + String.join("\n", hours));
+        return String.join("\n", lines) + "\n\n¿Querés reservar un turno? Escribí *menú* para ver las opciones.";
+    }
+
+    /** Une los horarios de todos los empleados por día y agrupa días consecutivos con el mismo texto. */
+    private List<String> openingHoursLines(List<Schedule> schedules) {
+        Map<DayOfWeek, String> hoursByDay = new LinkedHashMap<>();
+        for (DayOfWeek day : DayOfWeek.values()) {
+            List<Schedule> daySchedules = schedules.stream()
+                    .filter(s -> s.getDayOfWeek() == day)
+                    .sorted(java.util.Comparator.comparing(Schedule::getStartTime))
+                    .toList();
+            if (daySchedules.isEmpty()) {
+                continue;
+            }
+            List<LocalTime[]> merged = new ArrayList<>();
+            for (Schedule s : daySchedules) {
+                LocalTime[] last = merged.isEmpty() ? null : merged.get(merged.size() - 1);
+                if (last != null && !s.getStartTime().isAfter(last[1])) {
+                    if (s.getEndTime().isAfter(last[1])) {
+                        last[1] = s.getEndTime();
+                    }
+                } else {
+                    merged.add(new LocalTime[] {s.getStartTime(), s.getEndTime()});
+                }
+            }
+            hoursByDay.put(day, merged.stream()
+                    .map(r -> LOCAL_TIME_FORMATTER.format(r[0]) + " a " + LOCAL_TIME_FORMATTER.format(r[1]))
+                    .collect(Collectors.joining(" y ")));
+        }
+
+        List<String> result = new ArrayList<>();
+        DayOfWeek groupStart = null;
+        DayOfWeek previous = null;
+        String groupHours = null;
+        for (Map.Entry<DayOfWeek, String> entry : hoursByDay.entrySet()) {
+            boolean continues = previous != null && entry.getKey() == previous.plus(1)
+                    && entry.getValue().equals(groupHours);
+            if (!continues) {
+                if (groupStart != null) {
+                    result.add(dayRange(groupStart, previous) + ": " + groupHours);
+                }
+                groupStart = entry.getKey();
+                groupHours = entry.getValue();
+            }
+            previous = entry.getKey();
+        }
+        if (groupStart != null) {
+            result.add(dayRange(groupStart, previous) + ": " + groupHours);
+        }
+        return result;
+    }
+
+    private String dayRange(DayOfWeek from, DayOfWeek to) {
+        if (from == to) {
+            return dayName(from);
+        }
+        return dayName(from) + (to == from.plus(1) ? " y " : " a ") + dayName(to).toLowerCase(Locale.of("es", "ES"));
+    }
+
+    private String dayName(DayOfWeek day) {
+        String name = day.getDisplayName(TextStyle.FULL, Locale.of("es", "ES"));
+        return name.substring(0, 1).toUpperCase(Locale.of("es", "ES")) + name.substring(1);
     }
 
     /**
@@ -141,8 +250,11 @@ public class ConversationReplyFormatter {
     }
 
     public String askNewTime(Business business, AppointmentResponse appointment) {
-        return "Tu reserva es de " + describeAppointment(business, appointment)
-                + ". ¿Para cuándo querés moverla? Decime día y hora, por ejemplo \"mañana a las 15\".";
+        return "Tu reserva es de " + describeAppointment(business, appointment) + ".\n\n"
+                + "¿Para cuándo querés moverla?\n\n"
+                + "Decime el día y la hora. Por ejemplo:\n"
+                + "- \"Mañana a las 15\"\n"
+                + "- \"El 29 de octubre a las 14\"";
     }
 
     public String reschedulePrompt(Business business, AppointmentResponse original, Instant newStartAt) {

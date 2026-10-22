@@ -1068,8 +1068,8 @@ class ConversationServiceImplTest {
         assertThat(result.getReply()).doesNotContain("¿Qué servicio");
         assertThat(result.getReply()).doesNotContain("¿A qué hora");
         assertThat(result.getReply()).doesNotContain("¿Para cuándo");
-        // El saludo puro se redacta determinísticamente en backend, no con el texto libre de la IA.
-        assertThat(result.getReply()).contains("¿Te ayudo a reservar un turno");
+        // El saludo puro se redacta determinísticamente en backend (menú principal), no con el texto libre de la IA.
+        assertThat(result.getReply()).contains("¿En qué puedo ayudarte?").contains("1. 📅 Reservar un turno");
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2593,5 +2593,299 @@ class ConversationServiceImplTest {
 
         assertThat(result.getReply()).contains("No pude completar el cambio").doesNotContain("reprogramé");
         assertThat(result.getAppointmentId()).isNull();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // GS-BOT-003: menú principal numerado
+    // ---------------------------------------------------------------------------------------
+
+    private static final String AI_GREETING = "INTENT: GREETING\nCONFIDENCE: 0.9\nREPLY: hola";
+
+    private ConversationResponse greet(String phone) {
+        stubAi("Hola", AI_GREETING);
+        return say(phone, "Hola");
+    }
+
+    @Test
+    void greetingShowsWelcomeMenuWithDynamicBusinessName() {
+        business.setName("Barbería Don Pepe");
+
+        ConversationResponse result = greet("+595981700001");
+
+        assertThat(result.getReply()).isEqualTo("Hola 👋 Soy el asistente virtual de Barbería Don Pepe.\n\n"
+                + "¿En qué puedo ayudarte?\n\n"
+                + "1. 📅 Reservar un turno\n"
+                + "2. ❌ Cancelar un turno\n"
+                + "3. 🔄 Cambiar un turno\n"
+                + "4. ℹ️ Información del negocio\n\n"
+                + "Respondé con el número de la opción o escribí lo que necesitás.");
+        assertThat(statesByKey.get(key(1L, "+595981700001")).isMenuPending()).isTrue();
+    }
+
+    @Test
+    void menuOption1StartsBookingAndShowsNumberedCatalogWithoutCallingAi() {
+        String phone = "+595981700002";
+        stubCatalog(1L, service(4L, "Corte Premium", new BigDecimal("65000")),
+                service(6L, "Corte Barba", new BigDecimal("45000")));
+        greet(phone);
+
+        ConversationResponse result = say(phone, "1");
+
+        assertThat(result.getReply()).contains("1. Corte Barba — Gs. 45.000").contains("2. Corte Premium");
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.isMenuPending()).isFalse();
+        assertThat(state.offeredServiceIdList()).containsExactly(6L, 4L);
+        verify(aiProvider, never()).generateResponse(anyString(), eq("1"));
+    }
+
+    @Test
+    void menuOptions2And3StartCancellationAndRescheduleThroughTheSecureFlows() {
+        String phone = "+595981700003";
+        Customer customer = existingCustomer(phone, "Cristian");
+        AppointmentResponse own = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(2, 14),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, own);
+        greet(phone);
+
+        ConversationResponse cancel = say(phone, "2.");
+        assertThat(cancel.getReply()).contains("Corte Premium").contains("¿Querés cancelarla?");
+        assertThat(statesByKey.get(key(1L, phone)).getStage()).isEqualTo(ConversationStage.AWAITING_CANCEL_CONFIRM);
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+
+        say(phone, "no");
+        say(phone, "/reset");
+        greet(phone);
+        when(appointmentService.findUpcomingForCustomer(1L, customer.getId(), 5)).thenReturn(List.of(own));
+
+        ConversationResponse reschedule = say(phone, "3)");
+        assertThat(reschedule.getReply()).contains(
+                "Tu reserva es de Corte Premium con Juan Gómez el ");
+        assertThat(reschedule.getReply()).contains(" a las 14:00.\n\n"
+                + "¿Para cuándo querés moverla?\n\n"
+                + "Decime el día y la hora. Por ejemplo:\n"
+                + "- \"Mañana a las 15\"\n"
+                + "- \"El 29 de octubre a las 14\"");
+        assertThat(statesByKey.get(key(1L, phone)).getStage()).isEqualTo(ConversationStage.AWAITING_RESCHEDULE_TIME);
+        verify(appointmentService, never()).rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any());
+        verify(aiProvider, never()).generateResponse(anyString(), eq("2."));
+        verify(aiProvider, never()).generateResponse(anyString(), eq("3)"));
+    }
+
+    @Test
+    void menuOptions2And3ForUnknownCustomerReportNoAppointments() {
+        String phone = "+595981700004";
+        greet(phone);
+
+        ConversationResponse result = say(phone, "2");
+
+        assertThat(result.getReply()).contains("No encontré ninguna reserva");
+        verify(appointmentService, never()).findUpcomingForCustomer(anyLong(), anyLong(), anyInt());
+    }
+
+    @Test
+    void menuOption4ShowsRealBusinessInfoAndOmitsMissingFields() {
+        String phone = "+595981700005";
+        business.setAddress("Av. España 1234, Asunción");
+        business.setPhone("+595 21 555 000");
+        Employee juan = employee(3L, "Juan", "Gómez");
+        Employee ana = employee(8L, "Ana", "Paz");
+        lenient().when(scheduleRepository.findActiveByBusiness(1L, null, null)).thenReturn(List.of(
+                schedule(juan, DayOfWeek.MONDAY, 8, 12), schedule(juan, DayOfWeek.MONDAY, 14, 18),
+                schedule(ana, DayOfWeek.MONDAY, 9, 13),
+                schedule(juan, DayOfWeek.TUESDAY, 8, 12), schedule(juan, DayOfWeek.TUESDAY, 14, 18),
+                schedule(ana, DayOfWeek.TUESDAY, 9, 13),
+                schedule(juan, DayOfWeek.SATURDAY, 9, 13)));
+        greet(phone);
+
+        ConversationResponse result = say(phone, "4");
+
+        assertThat(result.getReply()).contains("Peluquería Elegance").contains("Dirección: Av. España 1234, Asunción")
+                .contains("Teléfono: +595 21 555 000")
+                .contains("Lunes y martes: 08:00 a 13:00 y 14:00 a 18:00")
+                .contains("Sábado: 09:00 a 13:00")
+                .contains("menú");
+        assertThat(result.getReply()).doesNotContain("Domingo").doesNotContain("@");
+        verify(aiProvider, never()).generateResponse(anyString(), eq("4"));
+
+        // Sin dirección, teléfono ni horarios configurados: se omiten o se indican como no disponibles.
+        String other = "+595981700006";
+        business.setAddress(null);
+        business.setPhone(" ");
+        lenient().when(scheduleRepository.findActiveByBusiness(1L, null, null)).thenReturn(List.of());
+        say(other, "Hola");
+        ConversationResponse bare = say(other, "4");
+        assertThat(bare.getReply()).doesNotContain("Dirección").doesNotContain("Teléfono")
+                .contains("Horarios de atención: no disponibles");
+    }
+
+    private Schedule schedule(Employee employee, DayOfWeek day, int fromHour, int toHour) {
+        Schedule schedule = new Schedule();
+        schedule.setEmployee(employee);
+        schedule.setDayOfWeek(day);
+        schedule.setStartTime(LocalTime.of(fromHour, 0));
+        schedule.setEndTime(LocalTime.of(toHour, 0));
+        return schedule;
+    }
+
+    @Test
+    void naturalLanguageStillWorksWhileMenuIsPending() {
+        String phone = "+595981700007";
+        stubCatalog(1L, service(4L, "Corte Premium", new BigDecimal("65000")));
+        greet(phone);
+        stubAi("Quiero reservar", BOOK_INTENT);
+
+        ConversationResponse result = say(phone, "Quiero reservar");
+
+        assertThat(result.getReply()).contains("1. Corte Premium");
+        assertThat(statesByKey.get(key(1L, phone)).isMenuPending()).isFalse();
+    }
+
+    @Test
+    void invalidMenuOptionShowsMenuAgainWithoutRunningAnyOperation() {
+        String phone = "+595981700008";
+        greet(phone);
+
+        ConversationResponse result = say(phone, "9");
+
+        assertThat(result.getReply()).contains("Esa opción no es válida").contains("4. ℹ️ Información del negocio");
+        assertThat(statesByKey.get(key(1L, phone)).isMenuPending()).isTrue();
+        verify(aiProvider, never()).generateResponse(anyString(), eq("9"));
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    void serviceNumbersAfterMenuOption1AreServiceSelectionsNotMenuOptions() {
+        String phone = "+595981700009";
+        stubCatalog(1L, service(4L, "Corte Premium", new BigDecimal("65000")),
+                service(6L, "Corte Barba", new BigDecimal("45000")));
+        greet(phone);
+        say(phone, "1");
+
+        ConversationResponse result = say(phone, "2");
+
+        assertThat(result.getReply()).contains("¿Para cuándo te gustaría el turno?");
+        assertThat(statesByKey.get(key(1L, phone)).getPendingServiceId()).isEqualTo(4L);
+    }
+
+    @Test
+    void appointmentNumbersAfterMenuOption2AreAppointmentChoicesNotMenuOptions() {
+        String phone = "+595981700010";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer,
+                apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14), AppointmentStatus.CONFIRMED),
+                apptResponse(51L, customer.getId(), "Corte Barba", daysAhead(2, 16), AppointmentStatus.CONFIRMED));
+        greet(phone);
+        assertThat(say(phone, "2").getReply()).contains("¿Cuál querés cancelar?");
+
+        ConversationResponse result = say(phone, "2");
+
+        assertThat(result.getReply()).contains("Corte Barba").contains("¿Querés cancelarla?");
+        assertThat(statesByKey.get(key(1L, phone)).getPendingOperationAppointmentId()).isEqualTo(51L);
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    void menuCommandDuringPendingCancellationKeepsStateAndNumbersNeverStartAnotherOperation() {
+        String phone = "+595981700011";
+        Customer customer = existingCustomer(phone, "Cristian");
+        AppointmentResponse own = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, own);
+        stubAi(CANCEL_MSG, AI_CANCEL);
+        say(phone, CANCEL_MSG);
+
+        ConversationResponse menu = say(phone, "menú");
+
+        assertThat(menu.getReply()).contains("no la descarté").doesNotContain("1. 📅");
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getStage()).isEqualTo(ConversationStage.AWAITING_CANCEL_CONFIRM);
+        assertThat(state.isMenuPending()).isFalse();
+
+        // "1" no inicia una reserva: sigue siendo una respuesta ambigua a la cancelación pendiente.
+        ConversationResponse number = say(phone, "1");
+        assertThat(number.getReply()).contains("Todavía no cancelé nada");
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+
+        // El "sí" posterior sigue confirmando la misma cancelación.
+        when(appointmentService.cancelForCustomer(1L, customer.getId(), 50L))
+                .thenReturn(apptResponse(50L, customer.getId(), "Corte Premium", own.getStartAt(),
+                        AppointmentStatus.CANCELLED));
+        assertThat(say(phone, "sí").getAppointmentId()).isEqualTo(50L);
+    }
+
+    @Test
+    void menuCommandDuringBookingDraftOrNumberedCatalogPreservesThem() {
+        String phone = "+595981700012";
+        stubCatalog(1L, service(4L, "Corte Premium", new BigDecimal("65000")),
+                service(6L, "Corte Barba", new BigDecimal("45000")));
+        stubAi("Quiero reservar", BOOK_INTENT);
+        say(phone, "Quiero reservar");
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.offeredServiceIdList()).containsExactly(6L, 4L);
+
+        assertThat(say(phone, "Menu").getReply()).contains("no la descarté");
+        assertThat(state.offeredServiceIdList()).containsExactly(6L, 4L);
+        assertThat(state.isMenuPending()).isFalse();
+
+        // Con el catálogo pendiente, "1" es el servicio 1 (no la opción 1 del menú).
+        say(phone, "1");
+        assertThat(state.getPendingServiceId()).isEqualTo(6L);
+
+        // Un saludo con borrador en curso no reinicia ni muestra el menú.
+        ConversationResponse greeting = greet(phone);
+        assertThat(greeting.getReply()).doesNotContain("1. 📅");
+        assertThat(state.getPendingServiceId()).isEqualTo(6L);
+    }
+
+    @Test
+    void menuCommandInACleanConversationShowsMenuAndEnablesMenuNumbers() {
+        String phone = "+595981700013";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED));
+
+        ConversationResponse menu = say(phone, "menú");
+        assertThat(menu.getReply()).contains("1. 📅 Reservar un turno");
+        assertThat(statesByKey.get(key(1L, phone)).isMenuPending()).isTrue();
+
+        assertThat(say(phone, "2").getReply()).contains("¿Querés cancelarla?");
+        verify(aiProvider, never()).generateResponse(anyString(), anyString());
+    }
+
+    @Test
+    void menuNumbersAreIgnoredAfterResetAndAfterStateExpiry() {
+        String phone = "+595981700014";
+        greet(phone);
+        say(phone, "/reset");
+        assertThat(statesByKey.get(key(1L, phone)).isMenuPending()).isFalse();
+        stubAi("1", "INTENT: UNKNOWN\nCONFIDENCE: 0.3\nREPLY: ¿Me contás más?");
+        assertThat(say(phone, "1").getReply()).contains("¿Me contás más?");
+
+        String other = "+595981700015";
+        greet(other);
+        backdateState(1L, other, Duration.ofMinutes(45));
+        assertThat(say(other, "1").getReply()).contains("¿Me contás más?");
+        assertThat(statesByKey.get(key(1L, other)).isMenuPending()).isFalse();
+    }
+
+    @Test
+    void menuStateIsIsolatedBetweenBusinessesAndUsesEachBusinessName() {
+        String phone = "+595981700016";
+        Business other = new Business();
+        other.setId(2L);
+        other.setName("Otra Barbería");
+        other.setTimezone("America/Asuncion");
+        lenient().when(businessRepository.findByIdAndActiveTrue(2L)).thenReturn(Optional.of(other));
+        stubCatalog(2L);
+        greet(phone);
+
+        // El menú pendiente es del negocio 1: en el negocio 2 el "1" no es una opción de menú.
+        stubAi("1", "INTENT: UNKNOWN\nCONFIDENCE: 0.3\nREPLY: ¿Me contás más?");
+        assertThat(conversationService.processChannelConversation(2L, phone, "1").getReply())
+                .contains("¿Me contás más?");
+        assertThat(statesByKey.get(key(1L, phone)).isMenuPending()).isTrue();
+
+        ConversationResponse welcome = conversationService.processChannelConversation(2L, "+595981700099", "Hola");
+        assertThat(welcome.getReply()).contains("Otra Barbería").doesNotContain("Peluquería Elegance");
     }
 }

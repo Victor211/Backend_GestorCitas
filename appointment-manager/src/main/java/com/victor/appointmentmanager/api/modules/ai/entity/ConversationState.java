@@ -80,6 +80,16 @@ public class ConversationState extends BaseEntity {
     @Column(name = "last_referenced_employee_name", length = 200)
     private String lastReferencedEmployeeName;
 
+    /**
+     * {@code true} solo mientras el menú principal fue lo último que se le mostró al cliente y sigue
+     * sin respuesta: es lo que habilita interpretar "1".."4" como opciones del menú. Se persiste porque
+     * cada mensaje es una request independiente. Se apaga al procesar CUALQUIER mensaje siguiente y
+     * nunca se enciende si hay un borrador, un catálogo numerado o una operación pendiente, así un
+     * número del menú no puede confundirse con un servicio, una cita, una fecha o una confirmación.
+     */
+    @Column(name = "menu_pending", nullable = false, columnDefinition = "boolean default false")
+    private boolean menuPending = false;
+
     // --- Operación sobre una cita existente (cancelar/reprogramar), separada del borrador de reserva ---
 
     @Enumerated(EnumType.STRING)
@@ -208,6 +218,7 @@ public class ConversationState extends BaseEntity {
     public void resetForNewConversation() {
         clearBookingDraft();
         clearPendingOperation();
+        this.menuPending = false;
         this.greeted = false;
         this.lastReferencedEmployeeId = null;
         this.lastReferencedEmployeeName = null;

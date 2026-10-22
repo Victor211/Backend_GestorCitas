@@ -244,6 +244,19 @@ public class ConversationServiceImpl implements ConversationService {
             // flujo normal ya con el borrador limpio, sin arrastrar la propuesta vencida.
         }
 
+        // Menú principal: el indicador persistido vale solo para ESTE mensaje (se apaga siempre).
+        boolean menuWasPending = state.isMenuPending();
+        state.setMenuPending(false);
+        if (isMenuCommand(message)) {
+            return respondToMenuCommand(business, state);
+        }
+        if (menuWasPending && isMenuContextFree(state)) {
+            Optional<ConversationResponse> selection = respondToMenuSelection(business, message, state, existingCustomer);
+            if (selection.isPresent()) {
+                return selection.get();
+            }
+        }
+
         if (state.getStage().isPendingOperationStage()) {
             return respondToPendingOperation(business, message, state, existingCustomer);
         }
@@ -381,7 +394,93 @@ public class ConversationServiceImpl implements ConversationService {
         return replyFormatter.serviceList(services);
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Menú principal (GS-BOT-003)
+    //  - Los números 1..4 solo se interpretan si state.menuPending (el menú fue lo último mostrado)
+    //    Y no hay borrador, catálogo numerado ni operación pendiente. menuPending se apaga al
+    //    procesar cualquier mensaje, así que no puede "filtrarse" a otras etapas.
+    //  - Comando "menú"/"menu" con una gestión en curso: NO descarta ni reemplaza nada y NO activa
+    //    menuPending (para que un número nunca dispare una operación distinta a la pendiente);
+    //    solo explica cómo continuar o abandonar. Sin gestión en curso muestra el menú.
+    //  - Un saludo con una gestión en curso no reinicia nada (sigue el flujo previo).
+    // ---------------------------------------------------------------------------------------
+
+    private static final Set<String> MENU_COMMANDS = Set.of("menu", "menú");
+    private static final String MENU_BUSY_REPLY =
+            "Tenés una gestión en curso y no la descarté. Seguí respondiendo a lo último que te pedí, "
+                    + "o escribí \"no\" o \"cancelar\" para dejarla. Después escribí *menú* para ver las opciones.";
+
+    private boolean isMenuCommand(String message) {
+        if (message == null) {
+            return false;
+        }
+        String cleaned = message.trim().toLowerCase(Locale.ROOT).replaceAll("^[^\\p{L}]+|[^\\p{L}]+$", "");
+        return MENU_COMMANDS.contains(cleaned);
+    }
+
+    /** Sin borrador de reserva, catálogo numerado ni operación sobre una cita pendiente. */
+    private boolean isMenuContextFree(ConversationState state) {
+        return state.getStage() == ConversationStage.COLLECTING
+                && !state.hasPendingOperation()
+                && !hasBookingDraftProgress(state)
+                && !state.hasOfferedServices();
+    }
+
+    private ConversationResponse showMenu(Business business, ConversationState state, String reply) {
+        state.setMenuPending(true);
+        state.setGreeted(true); // el texto ya incluye (o no necesita) la presentación
+        return finish(state, business, reply, ConversationIntent.GREETING, DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    private ConversationResponse respondToMenuCommand(Business business, ConversationState state) {
+        if (!isMenuContextFree(state)) {
+            return finish(state, business, MENU_BUSY_REPLY, ConversationIntent.UNKNOWN,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        return showMenu(business, state, state.isGreeted()
+                ? replyFormatter.menuOptions() : replyFormatter.welcomeMenu(business));
+    }
+
+    /** Resuelve "1".."4" del menú pendiente en Java; vacío si el mensaje no es un número (sigue el flujo normal). */
+    private Optional<ConversationResponse> respondToMenuSelection(Business business, String message,
+                                                                  ConversationState state,
+                                                                  Optional<Customer> existingCustomer) {
+        Matcher matcher = SERVICE_OPTION_NUMBER.matcher(message == null ? "" : message);
+        if (!matcher.matches()) {
+            return Optional.empty();
+        }
+        int option = Integer.parseInt(matcher.group(1));
+        switch (option) {
+            case 1 -> {
+                DispatchOutcome outcome = advanceBookingFlow(business, state);
+                return Optional.of(finishFromOutcome(state, business, outcome, ConversationIntent.BOOK_APPOINTMENT,
+                        DETERMINISTIC_CONFIDENCE));
+            }
+            case 2, 3 -> {
+                PendingOperation operation = option == 2 ? PendingOperation.CANCEL : PendingOperation.RESCHEDULE;
+                if (existingCustomer.isEmpty()) {
+                    return Optional.of(finish(state, business, NO_APPOINTMENT_FOUND_REPLY, intentOf(operation),
+                            DETERMINISTIC_CONFIDENCE, null));
+                }
+                return Optional.of(startAppointmentOperation(business, state, existingCustomer.get(), operation, null));
+            }
+            case 4 -> {
+                List<Schedule> schedules = scheduleRepository.findActiveByBusiness(business.getId(), null, null)
+                        .stream().filter(s -> Boolean.TRUE.equals(s.getEmployee().getActive())).toList();
+                return Optional.of(finish(state, business, replyFormatter.businessInfo(business, schedules),
+                        ConversationIntent.UNKNOWN, DETERMINISTIC_CONFIDENCE, null));
+            }
+            default -> {
+                return Optional.of(showMenu(business, state, replyFormatter.invalidMenuOption()));
+            }
+        }
+    }
+
     private ConversationResponse respondToPureGreeting(Business business, ConversationState state, ParsedAiReply parsed) {
+        if (isMenuContextFree(state)) {
+            return showMenu(business, state, state.isGreeted()
+                    ? replyFormatter.menuOptions() : replyFormatter.welcomeMenu(business));
+        }
         if (state.isGreeted()) {
             return finish(state, business, parsed.reply(), ConversationIntent.GREETING, parsed.confidence(), null);
         }
@@ -1004,12 +1103,19 @@ public class ConversationServiceImpl implements ConversationService {
         PendingOperation operation = parsed.intent() == ConversationIntent.RESCHEDULE_APPOINTMENT
                 ? PendingOperation.RESCHEDULE
                 : PendingOperation.CANCEL;
+        return startAppointmentOperation(business, state, customer, operation, parsed.startAtText());
+    }
+
+    /** Inicia cancelación/reprogramación (desde la IA o desde el menú); misma lógica segura en ambos casos. */
+    private ConversationResponse startAppointmentOperation(Business business, ConversationState state,
+                                                           Customer customer, PendingOperation operation,
+                                                           String startAtHint) {
         state.clearPendingOperation();
         state.setPendingOperation(operation);
-        if (operation == PendingOperation.RESCHEDULE && parsed.startAtText() != null) {
+        if (operation == PendingOperation.RESCHEDULE && startAtHint != null) {
             // Solo una pista: se valida recién cuando haya una cita propia identificada. Si no
             // se pudo interpretar, más adelante se vuelve a preguntar.
-            applyOperationStart(state, business, parsed.startAtText());
+            applyOperationStart(state, business, startAtHint);
         }
         return presentOwnAppointments(business, state, customer, null);
     }

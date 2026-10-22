@@ -5,6 +5,7 @@ import com.victor.appointmentmanager.api.modules.ai.exception.AmbiguousTimeExcep
 import com.victor.appointmentmanager.api.modules.ai.exception.MissingTimeException;
 import org.springframework.stereotype.Component;
 
+import java.time.Clock;
 import java.time.DateTimeException;
 import java.time.DayOfWeek;
 import java.time.Instant;
@@ -38,6 +39,17 @@ import java.util.regex.Pattern;
  */
 @Component
 public class BusinessDateTimeResolver {
+
+    private final Clock clock;
+
+    public BusinessDateTimeResolver() {
+        this(Clock.systemUTC());
+    }
+
+    /** Reloj inyectable (tests con fecha fija). La zona del negocio se aplica siempre sobre él. */
+    public BusinessDateTimeResolver(Clock clock) {
+        this.clock = clock;
+    }
 
     private static final DateTimeFormatter ABSOLUTE_DATE_TIME_FORMATTER = new DateTimeFormatterBuilder()
             .parseCaseInsensitive()
@@ -143,7 +155,15 @@ public class BusinessDateTimeResolver {
         }
     }
 
-    private LocalDateTime parseAbsoluteOrRelative(String expression, ZoneId businessZone) {
+    private LocalDateTime parseAbsoluteOrRelative(String rawExpression, ZoneId businessZone) {
+        // "para el 29 de octubre a las 15" / "para mañana a las 15": el "para" inicial no aporta nada.
+        String expression = LEADING_PARA.matcher(rawExpression).replaceFirst("").trim();
+
+        LocalDateTime explicitDate = tryParseExplicitDate(expression, businessZone);
+        if (explicitDate != null) {
+            return explicitDate;
+        }
+
         LocalDateTime relative = tryParseRelative(expression, businessZone);
         if (relative != null) {
             return relative;
@@ -159,8 +179,109 @@ public class BusinessDateTimeResolver {
         }
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Fechas explícitas en español (GS-BOT-004)
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * Fecha explícita al INICIO de la expresión: "29 de octubre", "el 29 de octubre de 2026",
+     * "29/10", "29-10-2026" (día/mes, orden de Paraguay). El resto de la expresión ({@code tail}) se
+     * valida aparte y la regex está anclada, así "servicio 29 de octubre" o un número suelto ("3")
+     * nunca se interpretan como fecha.
+     */
+    private static final Pattern EXPLICIT_DATE = Pattern.compile(
+            "(?i)^(?:el\\s+)?(\\d{1,2})\\s*(?:de\\s+(\\p{L}+)|[/\\-](\\d{1,2}))"
+                    + "(?:\\s*(?:de\\s+|[/\\-])\\s*(\\d{4}))?(?<tail>.*)$");
+    /** Lo único admitido después de la fecha: nada, o una hora "a las H[:mm]" con marcadores opcionales. */
+    private static final Pattern EXPLICIT_DATE_TIME_TAIL = Pattern.compile(
+            "(?i)^[\\s,]*(?:(?:de|por|esta)\\s+(?:la\\s+)?(?:tarde|mañana|noche)\\s+)?"
+                    + "a\\s+las\\s+\\d{1,2}(?::\\d{2})?(?:\\s*(?:hs|horas))?"
+                    + "(?:\\s+(?:de|por)\\s+la\\s+(?:tarde|mañana|noche))?\\s*$");
+    private static final Pattern LEADING_PARA = Pattern.compile("(?i)^para\\s+");
+
+    private static final Map<String, Integer> MONTHS = Map.ofEntries(
+            Map.entry("enero", 1), Map.entry("febrero", 2), Map.entry("marzo", 3),
+            Map.entry("abril", 4), Map.entry("mayo", 5), Map.entry("junio", 6),
+            Map.entry("julio", 7), Map.entry("agosto", 8), Map.entry("septiembre", 9),
+            Map.entry("setiembre", 9), Map.entry("octubre", 10), Map.entry("noviembre", 11),
+            Map.entry("diciembre", 12));
+
+    /**
+     * Devuelve {@code null} si la expresión no empieza con una fecha explícita (sigue el flujo
+     * normal). Si la reconoce:
+     * <ul>
+     *   <li>año explícito: se respeta tal cual (como siempre; una fecha pasada la rechaza después
+     *       AppointmentService), salvo que no haya hora, caso en que una fecha pasada se rechaza acá;</li>
+     *   <li>año omitido: se usa la primera ocurrencia FUTURA (hoy incluido) en la zona del negocio —
+     *       el año en curso, o el siguiente si esa fecha ya pasó o no existe (29 de febrero);</li>
+     *   <li>fecha inexistente (31 de febrero, mes 13): {@link BusinessException};</li>
+     *   <li>sin hora: {@link MissingTimeException} con la fecha resuelta, para que el bot pida la hora.</li>
+     * </ul>
+     */
+    private LocalDateTime tryParseExplicitDate(String expression, ZoneId businessZone) {
+        Matcher matcher = EXPLICIT_DATE.matcher(expression);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String tail = matcher.group("tail");
+        boolean hasTime = EXPLICIT_DATE_TIME_TAIL.matcher(tail).matches();
+        if (!hasTime && !tail.isBlank()) {
+            return null;
+        }
+
+        int day = Integer.parseInt(matcher.group(1));
+        Integer month = matcher.group(2) != null
+                ? MONTHS.get(matcher.group(2).toLowerCase(Locale.ROOT))
+                : Integer.valueOf(matcher.group(3));
+        if (month == null) {
+            return null; // "29 de algo": no es un mes, no es una fecha
+        }
+        String described = expression.trim();
+        LocalDate today = now(businessZone).toLocalDate();
+
+        LocalDate date;
+        if (matcher.group(4) != null) {
+            date = validDateOrNull(Integer.parseInt(matcher.group(4)), month, day);
+            if (date == null) {
+                throw new BusinessException("La fecha indicada no existe: '" + described + "'");
+            }
+            if (!hasTime && date.isBefore(today)) {
+                throw new BusinessException("Esa fecha ya pasó. ¿Podés indicarme otra?");
+            }
+        } else {
+            date = validDateOrNull(today.getYear(), month, day);
+            if (date == null || date.isBefore(today)) {
+                date = validDateOrNull(today.getYear() + 1, month, day);
+            }
+            if (date == null) {
+                throw new BusinessException("La fecha indicada no existe: '" + described + "'");
+            }
+        }
+
+        if (!hasTime) {
+            throw new MissingTimeException(date);
+        }
+        try {
+            return combineDateAndTime(expression, date, businessZone);
+        } catch (DateTimeException ex) {
+            throw new BusinessException("La hora indicada no es válida: '" + described + "'");
+        }
+    }
+
+    private LocalDate validDateOrNull(int year, int month, int day) {
+        try {
+            return LocalDate.of(year, month, day);
+        } catch (DateTimeException ex) {
+            return null;
+        }
+    }
+
+    private ZonedDateTime now(ZoneId zone) {
+        return ZonedDateTime.now(clock.withZone(zone));
+    }
+
     private LocalDateTime tryParseRelative(String expression, ZoneId businessZone) {
-        LocalDate today = ZonedDateTime.now(businessZone).toLocalDate();
+        LocalDate today = now(businessZone).toLocalDate();
 
         Matcher tomorrow = TOMORROW_PREFIX.matcher(expression);
         if (tomorrow.find()) {
@@ -262,8 +383,8 @@ public class BusinessDateTimeResolver {
         if (AM_MARKER.matcher(expression).find()) {
             return hour;
         }
-        if (date.equals(ZonedDateTime.now(businessZone).toLocalDate())) {
-            ZonedDateTime now = ZonedDateTime.now(businessZone);
+        if (date.equals(now(businessZone).toLocalDate())) {
+            ZonedDateTime now = now(businessZone);
             ZonedDateTime amCandidate = ZonedDateTime.of(date, LocalTime.of(hour, minute), businessZone);
             ZonedDateTime pmCandidate = ZonedDateTime.of(date, LocalTime.of(hour + 12, minute), businessZone);
             if (amCandidate.isBefore(now) && !pmCandidate.isBefore(now)) {
