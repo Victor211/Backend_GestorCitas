@@ -37,6 +37,41 @@ public interface AppointmentService {
 
     AppointmentResponse cancel(Long businessId, Long id);
 
+    // -------------------------------------------------------------------------------------
+    // Operaciones del canal del cliente (WhatsApp): TODAS reciben customerId y verifican en esta
+    // capa que la cita pertenece a ese cliente dentro de ese negocio. Una cita ajena o inexistente
+    // es indistinguible (AppointmentNotFoundException), para no revelar su existencia.
+    // -------------------------------------------------------------------------------------
+
+    /** Citas futuras y modificables (PENDING/CONFIRMED) del cliente, de la más próxima a la más lejana. */
+    List<AppointmentResponse> findUpcomingForCustomer(Long businessId, Long customerId, int limit);
+
+    /** La cita indicada solo si es del cliente y sigue siendo modificable; vacío en cualquier otro caso. */
+    java.util.Optional<AppointmentResponse> findModifiableForCustomer(Long businessId, Long customerId,
+                                                                       Long appointmentId);
+
+    /**
+     * Cancela la cita bajo bloqueo de fila. Lanza {@code AppointmentNotFoundException} si no es del
+     * cliente y {@code AppointmentNotModifiableException} si ya no es cancelable (incluida una cita
+     * ya cancelada: no hay "éxito" silencioso).
+     */
+    AppointmentResponse cancelForCustomer(Long businessId, Long customerId, Long appointmentId);
+
+    /**
+     * Disponibilidad real para mover la cita al nuevo horario (mismas reglas que
+     * {@link #checkAvailability}, pero ignorando la propia cita al medir solapamientos).
+     */
+    AvailabilityCheck checkRescheduleForCustomer(Long businessId, Long customerId, Long appointmentId,
+                                                  Instant newStartAt);
+
+    /**
+     * Reprograma bajo bloqueo de fila, revalidando propiedad, estado y disponibilidad dentro de la
+     * misma transacción de escritura. Excepciones como en {@link #cancelForCustomer}; si el horario
+     * ya no está libre lanza {@code BusinessException} sin modificar nada.
+     */
+    AppointmentResponse rescheduleForCustomer(Long businessId, Long customerId, Long appointmentId,
+                                               Instant newStartAt);
+
     /**
      * Única fuente de verdad para "¿este horario está disponible?": aplica exactamente las mismas
      * reglas (empleado-servicio, no en el pasado, horario laboral, sin solapamiento) que {@link

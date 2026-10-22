@@ -9,6 +9,7 @@ import com.victor.appointmentmanager.api.modules.appointments.dto.response.Appoi
 import com.victor.appointmentmanager.api.modules.appointments.entity.Appointment;
 import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentStatus;
 import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotFoundException;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotModifiableException;
 import com.victor.appointmentmanager.api.modules.appointments.mapper.AppointmentMapper;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
@@ -68,6 +69,10 @@ public class AppointmentServiceImpl implements AppointmentService {
      * calendario completo minuto a minuto.
      */
     private static final int SLOT_STEP_MINUTES = 30;
+
+    /** Estados desde los que un cliente puede cancelar o reprogramar su propia cita. */
+    private static final List<AppointmentStatus> CUSTOMER_MODIFIABLE_STATUSES =
+            List.of(AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED);
 
     private final AppointmentRepository appointmentRepository;
     private final BusinessRepository businessRepository;
@@ -183,6 +188,82 @@ public class AppointmentServiceImpl implements AppointmentService {
         }
 
         return appointmentMapper.toDto(appointment);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<AppointmentResponse> findUpcomingForCustomer(Long businessId, Long customerId, int limit) {
+        return appointmentRepository
+                .findByBusinessIdAndCustomerIdAndStatusInAndStartAtGreaterThanEqualOrderByStartAtAsc(
+                        businessId, customerId, CUSTOMER_MODIFIABLE_STATUSES, Instant.now(),
+                        PageRequest.of(0, limit))
+                .stream().map(appointmentMapper::toDto).toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public Optional<AppointmentResponse> findModifiableForCustomer(Long businessId, Long customerId,
+                                                                    Long appointmentId) {
+        return appointmentRepository.findByIdAndBusinessIdAndCustomerId(appointmentId, businessId, customerId)
+                .filter(this::isModifiableByCustomer)
+                .map(appointmentMapper::toDto);
+    }
+
+    @Override
+    @Transactional
+    public AppointmentResponse cancelForCustomer(Long businessId, Long customerId, Long appointmentId) {
+        Appointment appointment = findOwnedForUpdateOrThrow(businessId, customerId, appointmentId);
+        assertModifiableByCustomer(appointment);
+
+        appointment.setStatus(AppointmentStatus.CANCELLED);
+        return appointmentMapper.toDto(appointmentRepository.save(appointment));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AvailabilityCheck checkRescheduleForCustomer(Long businessId, Long customerId, Long appointmentId,
+                                                         Instant newStartAt) {
+        Appointment appointment = appointmentRepository
+                .findByIdAndBusinessIdAndCustomerId(appointmentId, businessId, customerId)
+                .orElseThrow(() -> new AppointmentNotFoundException("Cita no encontrada con id " + appointmentId));
+        assertModifiableByCustomer(appointment);
+
+        Instant newEndAt = calculateEndAt(newStartAt, appointment.getService());
+        AvailabilityReason reason = evaluateBookability(appointment.getBusiness(), appointment.getEmployee(),
+                appointment.getService(), newStartAt, newEndAt, appointment.getId());
+        return reason == null ? AvailabilityCheck.AVAILABLE : AvailabilityCheck.unavailable(reason);
+    }
+
+    @Override
+    @Transactional
+    public AppointmentResponse rescheduleForCustomer(Long businessId, Long customerId, Long appointmentId,
+                                                      Instant newStartAt) {
+        Appointment appointment = findOwnedForUpdateOrThrow(businessId, customerId, appointmentId);
+        assertModifiableByCustomer(appointment);
+
+        Instant newEndAt = calculateEndAt(newStartAt, appointment.getService());
+        assertBookable(appointment.getBusiness(), appointment.getEmployee(), appointment.getService(),
+                newStartAt, newEndAt, appointment.getId());
+
+        appointment.setStartAt(newStartAt);
+        appointment.setEndAt(newEndAt);
+        return appointmentMapper.toDto(appointmentRepository.save(appointment));
+    }
+
+    private Appointment findOwnedForUpdateOrThrow(Long businessId, Long customerId, Long appointmentId) {
+        return appointmentRepository.findOwnedForUpdate(appointmentId, businessId, customerId)
+                .orElseThrow(() -> new AppointmentNotFoundException("Cita no encontrada con id " + appointmentId));
+    }
+
+    private boolean isModifiableByCustomer(Appointment appointment) {
+        return CUSTOMER_MODIFIABLE_STATUSES.contains(appointment.getStatus())
+                && !appointment.getStartAt().isBefore(Instant.now());
+    }
+
+    private void assertModifiableByCustomer(Appointment appointment) {
+        if (!isModifiableByCustomer(appointment)) {
+            throw new AppointmentNotModifiableException("La cita ya no puede modificarse");
+        }
     }
 
     @Override

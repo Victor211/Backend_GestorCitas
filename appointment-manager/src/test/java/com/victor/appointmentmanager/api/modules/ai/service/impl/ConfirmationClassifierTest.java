@@ -48,4 +48,29 @@ class ConfirmationClassifierTest {
         assertThat(classifier.classify("   ")).isEqualTo(ConfirmationSignal.UNRECOGNIZED);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"sí", "Sí.", "dale", "Sí, dale", "confirmo", "ok", "está bien", "de acuerdo", "si por favor"})
+    void simpleAffirmationAcceptsOnlyBareConfirmations(String message) {
+        assertThat(classifier.isSimpleAffirmation(message)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Sí, pero a las 17", "Confirmo, aunque prefiero mañana", "No, mejor el viernes",
+            "sí o no", "no sé", "", "   ", "perfecto", "hola", "no"})
+    void simpleAffirmationRejectsConditionalAmbiguousOrNegativeMessages(String message) {
+        assertThat(classifier.isSimpleAffirmation(message)).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"no", "No.", "mejor no", "no gracias", "olvidalo", "no, está bien así"})
+    void simpleNegationAcceptsOnlyBareRefusals(String message) {
+        assertThat(classifier.isSimpleNegation(message)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"No, mejor el viernes", "no sé", "sí", "no quiero a las 5", "", "cancelar"})
+    void simpleNegationRejectsRefusalsWithModifications(String message) {
+        assertThat(classifier.isSimpleNegation(message)).isFalse();
+    }
+
 }

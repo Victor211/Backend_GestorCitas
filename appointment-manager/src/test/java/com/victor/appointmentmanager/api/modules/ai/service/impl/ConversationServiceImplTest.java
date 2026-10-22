@@ -14,7 +14,9 @@ import com.victor.appointmentmanager.api.modules.ai.prompt.SystemPromptBuilder;
 import com.victor.appointmentmanager.api.modules.ai.repository.ConversationStateRepository;
 import com.victor.appointmentmanager.api.modules.appointments.dto.request.CreateAppointmentRequest;
 import com.victor.appointmentmanager.api.modules.appointments.dto.response.AppointmentResponse;
-import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
+import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentStatus;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotFoundException;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotModifiableException;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
 import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityCheck;
 import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityReason;
@@ -88,9 +90,6 @@ class ConversationServiceImplTest {
 
     @Mock
     private ScheduleRepository scheduleRepository;
-
-    @Mock
-    private AppointmentRepository appointmentRepository;
 
     @Mock
     private AppointmentService appointmentService;
@@ -182,7 +181,7 @@ class ConversationServiceImplTest {
         ConversationReplyFormatter replyFormatter = new ConversationReplyFormatter(guaraniAmountFormatter);
 
         conversationService = new ConversationServiceImpl(aiProvider, systemPromptBuilder, businessRepository,
-                serviceRepository, employeeRepository, scheduleRepository, appointmentRepository, appointmentService,
+                serviceRepository, employeeRepository, scheduleRepository, appointmentService,
                 currentUserProvider, businessDateTimeResolver, conversationStateStore, customerIdentityResolver,
                 confirmationClassifier, replyFormatter, guaraniAmountFormatter);
     }
@@ -2174,4 +2173,425 @@ class ConversationServiceImplTest {
         verify(aiProvider, never()).generateResponse(anyString(), eq("sí"));
     }
 
+
+    // ---------------------------------------------------------------------------------------
+    // GS-BOT-002: cancelación y reprogramación seguras (propiedad, confirmación explícita,
+    // respuesta construida con el resultado real, nunca con el REPLY de la IA).
+    // ---------------------------------------------------------------------------------------
+
+    private static final String CANCEL_MSG = "Quiero cancelar mi turno";
+    private static final String RESCHEDULE_MSG = "Quiero cambiar mi turno para mañana a las 14";
+    /** El REPLY de la IA afirma éxito y trae un APPOINTMENT_ID ajeno: ambos deben ignorarse. */
+    private static final String AI_CANCEL = "INTENT: CANCEL_APPOINTMENT\nAPPOINTMENT_ID: 999\nCONFIDENCE: 0.9\n"
+            + "REPLY: Listo, ya cancelé tu cita";
+    private static final String AI_RESCHEDULE = "INTENT: RESCHEDULE_APPOINTMENT\nAPPOINTMENT_ID: 999\n"
+            + "START_AT: mañana a las 14\nCONFIDENCE: 0.9\nREPLY: Listo, ya reprogramé tu cita";
+
+    private AppointmentResponse apptResponse(Long id, Long customerId, String serviceName, Instant startAt,
+                                              AppointmentStatus status) {
+        AppointmentResponse response = new AppointmentResponse();
+        response.setId(id);
+        response.setBusinessId(1L);
+        response.setCustomerId(customerId);
+        response.setServiceName(serviceName);
+        response.setEmployeeName("Juan Gómez");
+        response.setStartAt(startAt);
+        response.setStatus(status);
+        return response;
+    }
+
+    private Instant daysAhead(int days, int hour) {
+        return ZonedDateTime.of(LocalDate.now(ASUNCION).plusDays(days), LocalTime.of(hour, 0), ASUNCION).toInstant();
+    }
+
+    /** Stubs de las citas futuras propias del cliente (lista + lookup individual). */
+    private void stubOwnAppointments(Customer customer, AppointmentResponse... appointments) {
+        when(appointmentService.findUpcomingForCustomer(1L, customer.getId(), 5)).thenReturn(List.of(appointments));
+        for (AppointmentResponse a : appointments) {
+            lenient().when(appointmentService.findModifiableForCustomer(1L, customer.getId(), a.getId()))
+                    .thenReturn(Optional.of(a));
+        }
+    }
+
+    private ConversationResponse say(String phone, String message) {
+        return conversationService.processChannelConversation(1L, phone, message);
+    }
+
+    @Test
+    void cancelOwnAppointmentRequiresExplicitConfirmationAndRepliesFromPersistedResult() {
+        String phone = "+595981600001";
+        Customer customer = existingCustomer(phone, "Cristian");
+        AppointmentResponse own = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, own);
+        stubAi(CANCEL_MSG, AI_CANCEL);
+
+        ConversationResponse question = say(phone, CANCEL_MSG);
+
+        assertThat(question.getReply()).contains("Corte Premium").contains("14:00").contains("¿Querés cancelarla?");
+        assertThat(question.getReply()).doesNotContain("Listo, ya cancelé");
+        assertThat(question.getAppointmentId()).isNull();
+        assertThat(statesByKey.get(key(1L, phone)).getStage()).isEqualTo(ConversationStage.AWAITING_CANCEL_CONFIRM);
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+
+        when(appointmentService.cancelForCustomer(1L, customer.getId(), 50L))
+                .thenReturn(apptResponse(50L, customer.getId(), "Corte Premium", own.getStartAt(),
+                        AppointmentStatus.CANCELLED));
+        ConversationResponse done = say(phone, "sí");
+
+        assertThat(done.getReply()).contains("cancelé tu reserva").contains("Corte Premium");
+        assertThat(done.getAppointmentId()).isEqualTo(50L);
+        assertThat(done.getIntent()).isEqualTo(ConversationIntent.CANCEL_APPOINTMENT);
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.hasPendingOperation()).isFalse();
+        assertThat(state.getStage()).isEqualTo(ConversationStage.COLLECTING);
+        verify(appointmentService, never()).cancelForCustomer(eq(1L), anyLong(), eq(999L));
+        verify(appointmentService, never()).cancel(anyLong(), anyLong());
+        verify(aiProvider, never()).generateResponse(anyString(), eq("sí"));
+    }
+
+    @Test
+    void cancelNeverTouchesAnotherCustomersAppointmentEvenIfAiReturnsItsId() {
+        String phone = "+595981600002";
+        Customer customer = existingCustomer(phone, "Cristian");
+        // La cita 999 es de otra persona: no aparece entre las citas propias del cliente.
+        when(appointmentService.findUpcomingForCustomer(1L, customer.getId(), 5)).thenReturn(List.of());
+        stubAi(CANCEL_MSG, AI_CANCEL);
+
+        ConversationResponse result = say(phone, CANCEL_MSG);
+
+        assertThat(result.getReply()).contains("No encontré ninguna reserva");
+        assertThat(result.getReply()).doesNotContain("Listo, ya cancelé");
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+        verify(appointmentService, never()).cancel(anyLong(), anyLong());
+        assertThat(statesByKey.get(key(1L, phone)).hasPendingOperation()).isFalse();
+    }
+
+    @Test
+    void cancelRejectedByServiceLayerForForeignAppointmentDoesNotClaimSuccess() {
+        String phone = "+595981600003";
+        Customer customer = existingCustomer(phone, "Cristian");
+        AppointmentResponse own = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, own);
+        stubAi(CANCEL_MSG, AI_CANCEL);
+        say(phone, CANCEL_MSG);
+        when(appointmentService.cancelForCustomer(1L, customer.getId(), 50L))
+                .thenThrow(new AppointmentNotFoundException("no es tuya"));
+
+        ConversationResponse result = say(phone, "sí");
+
+        assertThat(result.getReply()).contains("ya no se puede modificar");
+        assertThat(result.getReply()).doesNotContain("cancelé");
+        assertThat(result.getAppointmentId()).isNull();
+        assertThat(statesByKey.get(key(1L, phone)).hasPendingOperation()).isFalse();
+    }
+
+    @Test
+    void severalUpcomingAppointmentsAskTheCustomerToChooseInsteadOfPickingOne() {
+        String phone = "+595981600004";
+        Customer customer = existingCustomer(phone, "Cristian");
+        AppointmentResponse first = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED);
+        AppointmentResponse second = apptResponse(51L, customer.getId(), "Corte Barba", daysAhead(2, 16),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, first, second);
+        stubAi(CANCEL_MSG, AI_CANCEL);
+
+        ConversationResponse list = say(phone, CANCEL_MSG);
+
+        assertThat(list.getReply()).contains("1. Corte Premium").contains("2. Corte Barba")
+                .contains("¿Cuál querés cancelar?");
+        assertThat(statesByKey.get(key(1L, phone)).getStage())
+                .isEqualTo(ConversationStage.AWAITING_APPOINTMENT_CHOICE);
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+
+        ConversationResponse invalid = say(phone, "7");
+        assertThat(invalid.getReply()).contains("Esa opción no es válida").contains("2. Corte Barba");
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+
+        ConversationResponse chosen = say(phone, "2");
+        assertThat(chosen.getReply()).contains("Corte Barba").contains("¿Querés cancelarla?");
+
+        when(appointmentService.cancelForCustomer(1L, customer.getId(), 51L))
+                .thenReturn(apptResponse(51L, customer.getId(), "Corte Barba", second.getStartAt(),
+                        AppointmentStatus.CANCELLED));
+        ConversationResponse done = say(phone, "dale");
+        assertThat(done.getAppointmentId()).isEqualTo(51L);
+        verify(appointmentService, never()).cancelForCustomer(eq(1L), eq(customer.getId()), eq(50L));
+    }
+
+    @Test
+    void negativeReplyDiscardsPendingCancellationWithoutModifyingAnything() {
+        String phone = "+595981600005";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED));
+        stubAi(CANCEL_MSG, AI_CANCEL);
+        say(phone, CANCEL_MSG);
+
+        ConversationResponse result = say(phone, "no");
+
+        assertThat(result.getReply()).contains("no hice ningún cambio");
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.hasPendingOperation()).isFalse();
+        assertThat(state.getStage()).isEqualTo(ConversationStage.COLLECTING);
+    }
+
+    @Test
+    void ambiguousOrConditionalRepliesNeverExecuteCancellation() {
+        String phone = "+595981600006";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED));
+        stubAi(CANCEL_MSG, AI_CANCEL);
+        say(phone, CANCEL_MSG);
+
+        for (String ambiguous : List.of("no sé", "Sí, pero a las 17", "Confirmo, aunque prefiero mañana",
+                "No, mejor el viernes", "quizás")) {
+            ConversationResponse result = say(phone, ambiguous);
+            assertThat(result.getReply()).contains("Todavía no cancelé nada").contains("¿Querés cancelarla?");
+            assertThat(statesByKey.get(key(1L, phone)).getStage()).isEqualTo(ConversationStage.AWAITING_CANCEL_CONFIRM);
+        }
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    void expiredPendingCancellationIsNeverExecuted() {
+        String phone = "+595981600007";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED));
+        stubAi(CANCEL_MSG, AI_CANCEL);
+        say(phone, CANCEL_MSG);
+        backdateState(1L, phone, Duration.ofMinutes(45));
+
+        ConversationResponse result = say(phone, "sí");
+
+        assertThat(result.getReply()).contains("ya venció");
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+        assertThat(statesByKey.get(key(1L, phone)).hasPendingOperation()).isFalse();
+    }
+
+    @Test
+    void alreadyCancelledOrIneligibleAppointmentIsReportedNotConfirmedAsSuccess() {
+        String phone = "+595981600008";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED));
+        stubAi(CANCEL_MSG, AI_CANCEL);
+        say(phone, CANCEL_MSG);
+        when(appointmentService.cancelForCustomer(1L, customer.getId(), 50L))
+                .thenThrow(new AppointmentNotModifiableException("ya cancelada"));
+
+        ConversationResponse result = say(phone, "sí");
+
+        assertThat(result.getReply()).contains("ya no se puede modificar").doesNotContain("cancelé");
+        assertThat(result.getAppointmentId()).isNull();
+    }
+
+    @Test
+    void persistenceErrorWhileCancellingNeverReportsSuccess() {
+        String phone = "+595981600009";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED));
+        stubAi(CANCEL_MSG, AI_CANCEL);
+        say(phone, CANCEL_MSG);
+        when(appointmentService.cancelForCustomer(1L, customer.getId(), 50L))
+                .thenThrow(new IllegalStateException("db down"));
+
+        ConversationResponse result = say(phone, "sí");
+
+        assertThat(result.getReply()).contains("No pude completar el cambio").doesNotContain("cancelé")
+                .doesNotContain("db down");
+        assertThat(result.getAppointmentId()).isNull();
+        assertThat(statesByKey.get(key(1L, phone)).hasPendingOperation()).isFalse();
+    }
+
+    @Test
+    void cancelFlowKeepsNewBookingDraftSeparateAndResetClearsPendingOperation() {
+        String phone = "+595981600010";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(1, 14),
+                AppointmentStatus.CONFIRMED));
+        ConversationState seeded = new ConversationState();
+        seeded.setBusinessId(1L);
+        seeded.setCustomerPhone(phone);
+        seeded.setPendingServiceId(4L);
+        statesByKey.put(key(1L, phone), seeded);
+        stubAi("Necesito anular mi reserva", AI_CANCEL);
+
+        say(phone, "Necesito anular mi reserva");
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.hasPendingOperation()).isTrue();
+        assertThat(state.getPendingServiceId()).isEqualTo(4L);
+
+        say(phone, "/reset");
+
+        assertThat(state.hasPendingOperation()).isFalse();
+        assertThat(state.getPendingServiceId()).isNull();
+        assertThat(state.getStage()).isEqualTo(ConversationStage.COLLECTING);
+        verify(appointmentService, never()).cancelForCustomer(anyLong(), anyLong(), anyLong());
+    }
+
+    @Test
+    void rescheduleOwnAppointmentChecksAvailabilityConfirmsAndRepliesFromPersistedResult() {
+        String phone = "+595981600011";
+        Customer customer = existingCustomer(phone, "Cristian");
+        AppointmentResponse own = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(3, 10),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, own);
+        when(appointmentService.checkRescheduleForCustomer(eq(1L), eq(customer.getId()), eq(50L), any(Instant.class)))
+                .thenReturn(AvailabilityCheck.AVAILABLE);
+        stubAi(RESCHEDULE_MSG, AI_RESCHEDULE);
+
+        ConversationResponse proposal = say(phone, RESCHEDULE_MSG);
+
+        assertThat(proposal.getReply()).contains("Corte Premium").contains("¿Querés pasarla a")
+                .contains("mañana a las 14:00");
+        assertThat(proposal.getReply()).doesNotContain("Listo, ya reprogramé");
+        verify(appointmentService, never()).rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any());
+        verify(appointmentService, never()).reschedule(anyLong(), anyLong(), any());
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getStage()).isEqualTo(ConversationStage.AWAITING_RESCHEDULE_CONFIRM);
+        Instant proposed = state.getPendingOperationNewStartAt();
+        assertThat(proposed).isEqualTo(daysAhead(1, 14));
+
+        when(appointmentService.rescheduleForCustomer(1L, customer.getId(), 50L, proposed))
+                .thenReturn(apptResponse(50L, customer.getId(), "Corte Premium", proposed,
+                        AppointmentStatus.CONFIRMED));
+        ConversationResponse done = say(phone, "sí");
+
+        assertThat(done.getReply()).contains("reprogramé tu reserva").contains("14:00");
+        assertThat(done.getAppointmentId()).isEqualTo(50L);
+        assertThat(state.hasPendingOperation()).isFalse();
+        verify(appointmentService, never()).rescheduleForCustomer(eq(1L), anyLong(), eq(999L), any());
+    }
+
+    @Test
+    void rescheduleOfForeignAppointmentIsRejectedEvenIfIdIsKnown() {
+        String phone = "+595981600012";
+        Customer customer = existingCustomer(phone, "Cristian");
+        // Sin citas propias: el id 999 que devuelve la IA nunca se usa.
+        when(appointmentService.findUpcomingForCustomer(1L, customer.getId(), 5)).thenReturn(List.of());
+        stubAi(RESCHEDULE_MSG, AI_RESCHEDULE);
+
+        ConversationResponse result = say(phone, RESCHEDULE_MSG);
+
+        assertThat(result.getReply()).contains("No encontré ninguna reserva").doesNotContain("reprogramé");
+        verify(appointmentService, never()).rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any());
+        verify(appointmentService, never()).reschedule(anyLong(), anyLong(), any());
+
+        // Y aunque la propiedad cambiara entre la propuesta y el "sí", la capa de servicio la rechaza.
+        AppointmentResponse own = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(3, 10),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, own);
+        lenient().when(appointmentService.checkRescheduleForCustomer(anyLong(), anyLong(), anyLong(), any()))
+                .thenReturn(AvailabilityCheck.AVAILABLE);
+        // Se re-stubea la lista para la segunda conversación del mismo cliente.
+        say(phone, RESCHEDULE_MSG);
+        when(appointmentService.rescheduleForCustomer(eq(1L), eq(customer.getId()), eq(50L), any()))
+                .thenThrow(new AppointmentNotFoundException("ajena"));
+        ConversationResponse rejected = say(phone, "sí");
+        assertThat(rejected.getReply()).contains("ya no se puede modificar").doesNotContain("reprogramé");
+        assertThat(rejected.getAppointmentId()).isNull();
+    }
+
+    @Test
+    void yesWithTimeChangeDoesNotExecuteThePreviousRescheduleProposal() {
+        String phone = "+595981600013";
+        Customer customer = existingCustomer(phone, "Cristian");
+        AppointmentResponse own = apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(3, 10),
+                AppointmentStatus.CONFIRMED);
+        stubOwnAppointments(customer, own);
+        when(appointmentService.checkRescheduleForCustomer(eq(1L), eq(customer.getId()), eq(50L), any(Instant.class)))
+                .thenReturn(AvailabilityCheck.AVAILABLE);
+        stubAi(RESCHEDULE_MSG, AI_RESCHEDULE);
+        say(phone, RESCHEDULE_MSG);
+        stubAi("Sí, pero a las 17", "INTENT: BOOK_APPOINTMENT\nSTART_AT: a las 17\nCONFIDENCE: 0.8\nREPLY: ok");
+
+        ConversationResponse result = say(phone, "Sí, pero a las 17");
+
+        assertThat(result.getReply()).contains("¿Querés pasarla a").contains("17:00");
+        verify(appointmentService, never()).rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any());
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getStage()).isEqualTo(ConversationStage.AWAITING_RESCHEDULE_CONFIRM);
+        assertThat(state.getPendingOperationNewStartAt()).isEqualTo(daysAhead(1, 17));
+
+        // Un "no, mejor el viernes" tampoco ejecuta ni descarta en silencio: es una modificación.
+        stubAi("No, mejor el viernes", "INTENT: RESCHEDULE_APPOINTMENT\nSTART_AT: NONE\nCONFIDENCE: 0.6\nREPLY: ok");
+        ConversationResponse changed = say(phone, "No, mejor el viernes");
+        assertThat(changed.getReply()).contains("Todavía no cambié nada");
+        verify(appointmentService, never()).rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any());
+    }
+
+    @Test
+    void rescheduleNegativeReplyLeavesAppointmentUntouched() {
+        String phone = "+595981600014";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(3, 10),
+                AppointmentStatus.CONFIRMED));
+        when(appointmentService.checkRescheduleForCustomer(anyLong(), anyLong(), anyLong(), any()))
+                .thenReturn(AvailabilityCheck.AVAILABLE);
+        stubAi(RESCHEDULE_MSG, AI_RESCHEDULE);
+        say(phone, RESCHEDULE_MSG);
+
+        ConversationResponse result = say(phone, "no");
+
+        assertThat(result.getReply()).contains("no hice ningún cambio");
+        verify(appointmentService, never()).rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any());
+        assertThat(statesByKey.get(key(1L, phone)).hasPendingOperation()).isFalse();
+    }
+
+    @Test
+    void busySlotAtProposalAndSlotTakenAtConfirmationAskForAnotherTimeWithoutClaimingSuccess() {
+        String phone = "+595981600015";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(3, 10),
+                AppointmentStatus.CONFIRMED));
+        when(appointmentService.checkRescheduleForCustomer(anyLong(), anyLong(), anyLong(), any()))
+                .thenReturn(AvailabilityCheck.unavailable(AvailabilityReason.OVERLAPPING))
+                .thenReturn(AvailabilityCheck.AVAILABLE);
+        stubAi(RESCHEDULE_MSG, AI_RESCHEDULE);
+
+        ConversationResponse busy = say(phone, RESCHEDULE_MSG);
+        assertThat(busy.getReply()).contains("ya está ocupado");
+        assertThat(statesByKey.get(key(1L, phone)).getStage()).isEqualTo(ConversationStage.AWAITING_RESCHEDULE_TIME);
+
+        stubAi("a las 15 mañana", "INTENT: RESCHEDULE_APPOINTMENT\nSTART_AT: mañana a las 15\nCONFIDENCE: 0.8\nREPLY: ok");
+        ConversationResponse proposal = say(phone, "a las 15 mañana");
+        assertThat(proposal.getReply()).contains("¿Querés pasarla a").contains("15:00");
+
+        // Entre la propuesta y el "sí" alguien más tomó el horario.
+        when(appointmentService.rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any()))
+                .thenThrow(new BusinessException("La cita se superpone con otra cita existente del empleado"));
+        ConversationResponse taken = say(phone, "sí");
+
+        assertThat(taken.getReply()).contains("acaba de dejar de estar disponible").doesNotContain("reprogramé");
+        assertThat(taken.getAppointmentId()).isNull();
+        ConversationState state = statesByKey.get(key(1L, phone));
+        assertThat(state.getStage()).isEqualTo(ConversationStage.AWAITING_RESCHEDULE_TIME);
+        assertThat(state.getPendingOperationNewStartAt()).isNull();
+    }
+
+    @Test
+    void persistenceErrorWhileReschedulingNeverReportsSuccess() {
+        String phone = "+595981600016";
+        Customer customer = existingCustomer(phone, "Cristian");
+        stubOwnAppointments(customer, apptResponse(50L, customer.getId(), "Corte Premium", daysAhead(3, 10),
+                AppointmentStatus.CONFIRMED));
+        when(appointmentService.checkRescheduleForCustomer(anyLong(), anyLong(), anyLong(), any()))
+                .thenReturn(AvailabilityCheck.AVAILABLE);
+        stubAi(RESCHEDULE_MSG, AI_RESCHEDULE);
+        say(phone, RESCHEDULE_MSG);
+        when(appointmentService.rescheduleForCustomer(anyLong(), anyLong(), anyLong(), any()))
+                .thenThrow(new IllegalStateException("db down"));
+
+        ConversationResponse result = say(phone, "sí");
+
+        assertThat(result.getReply()).contains("No pude completar el cambio").doesNotContain("reprogramé");
+        assertThat(result.getAppointmentId()).isNull();
+    }
 }

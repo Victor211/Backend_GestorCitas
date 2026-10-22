@@ -2,6 +2,7 @@ package com.victor.appointmentmanager.api.modules.ai.entity;
 
 import com.victor.appointmentmanager.api.common.entity.BaseEntity;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationStage;
+import com.victor.appointmentmanager.api.modules.ai.enums.PendingOperation;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -79,6 +80,28 @@ public class ConversationState extends BaseEntity {
     @Column(name = "last_referenced_employee_name", length = 200)
     private String lastReferencedEmployeeName;
 
+    // --- Operación sobre una cita existente (cancelar/reprogramar), separada del borrador de reserva ---
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "pending_operation", length = 20)
+    private PendingOperation pendingOperation;
+
+    /** Cita propia sobre la que se opera; se revalida (propiedad, estado) en cada paso y al ejecutar. */
+    @Column(name = "pending_operation_appointment_id")
+    private Long pendingOperationAppointmentId;
+
+    /** Ids (separados por coma, en el orden mostrado) de las citas propias ofrecidas para elegir. */
+    @Column(name = "pending_operation_options", length = 200)
+    private String pendingOperationOptions;
+
+    /** Nuevo horario ya resuelto y validado, propuesto en una reprogramación. */
+    @Column(name = "pending_operation_new_start_at")
+    private Instant pendingOperationNewStartAt;
+
+    /** Nueva fecha ya resuelta cuando el cliente todavía no indicó la hora de la reprogramación. */
+    @Column(name = "pending_operation_new_date")
+    private LocalDate pendingOperationNewDate;
+
     /**
      * Ids reales de los Services tal como se numeraron en el último catálogo mostrado al cliente,
      * en orden (la posición 1 es el primer id), separados por coma. Es la correspondencia entre
@@ -113,6 +136,37 @@ public class ConversationState extends BaseEntity {
 
     public boolean hasPendingEmployee() {
         return pendingEmployeeId != null;
+    }
+
+    public boolean hasPendingOperation() {
+        return pendingOperation != null;
+    }
+
+    public List<Long> pendingOperationOptionList() {
+        if (pendingOperationOptions == null || pendingOperationOptions.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(pendingOperationOptions.split(",")).map(String::trim).map(Long::valueOf).toList();
+    }
+
+    public void offerPendingOperationOptions(List<Long> appointmentIds) {
+        this.pendingOperationOptions = appointmentIds.stream().map(String::valueOf)
+                .collect(Collectors.joining(","));
+    }
+
+    /**
+     * Descarta cualquier operación sobre una cita existente. No toca el borrador de reserva
+     * nueva; si la etapa actual era de una operación, vuelve a COLLECTING.
+     */
+    public void clearPendingOperation() {
+        this.pendingOperation = null;
+        this.pendingOperationAppointmentId = null;
+        this.pendingOperationOptions = null;
+        this.pendingOperationNewStartAt = null;
+        this.pendingOperationNewDate = null;
+        if (stage != null && stage.isPendingOperationStage()) {
+            this.stage = ConversationStage.COLLECTING;
+        }
     }
 
     public boolean hasOfferedServices() {
@@ -153,6 +207,7 @@ public class ConversationState extends BaseEntity {
      */
     public void resetForNewConversation() {
         clearBookingDraft();
+        clearPendingOperation();
         this.greeted = false;
         this.lastReferencedEmployeeId = null;
         this.lastReferencedEmployeeName = null;

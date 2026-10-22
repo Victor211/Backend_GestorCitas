@@ -10,6 +10,8 @@ import com.victor.appointmentmanager.api.modules.ai.entity.ConversationState;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConfirmationSignal;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationIntent;
 import com.victor.appointmentmanager.api.modules.ai.enums.ConversationStage;
+import com.victor.appointmentmanager.api.modules.ai.enums.PendingOperation;
+import com.victor.appointmentmanager.api.modules.ai.enums.PendingOperation;
 import com.victor.appointmentmanager.api.modules.ai.exception.AmbiguousTimeException;
 import com.victor.appointmentmanager.api.modules.ai.exception.MissingTimeException;
 import com.victor.appointmentmanager.api.modules.ai.format.ConversationReplyFormatter;
@@ -17,14 +19,16 @@ import com.victor.appointmentmanager.api.modules.ai.format.GuaraniAmountFormatte
 import com.victor.appointmentmanager.api.modules.ai.prompt.SystemPromptBuilder;
 import com.victor.appointmentmanager.api.modules.ai.service.ConversationService;
 import com.victor.appointmentmanager.api.modules.appointments.dto.request.CreateAppointmentRequest;
-import com.victor.appointmentmanager.api.modules.appointments.dto.request.RescheduleAppointmentRequest;
 import com.victor.appointmentmanager.api.modules.appointments.dto.response.AppointmentResponse;
-import com.victor.appointmentmanager.api.modules.appointments.entity.Appointment;
 import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentStatus;
-import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AppointmentService;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotFoundException;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotModifiableException;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityCheck;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotFoundException;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotModifiableException;
+import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityCheck;
 import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityReason;
-import com.victor.appointmentmanager.api.modules.appointments.specification.AppointmentSpecifications;
 import com.victor.appointmentmanager.api.modules.customers.entity.Customer;
 import com.victor.appointmentmanager.api.modules.employees.entity.Employee;
 import com.victor.appointmentmanager.api.modules.employees.repository.EmployeeRepository;
@@ -37,11 +41,8 @@ import com.victor.appointmentmanager.api.shared.entity.Business;
 import com.victor.appointmentmanager.api.shared.repository.BusinessRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.domain.Sort;
-import org.springframework.data.jpa.domain.Specification;
 
 import java.time.Instant;
 import java.time.LocalDate;
@@ -160,7 +161,6 @@ public class ConversationServiceImpl implements ConversationService {
     private final ServiceRepository serviceRepository;
     private final EmployeeRepository employeeRepository;
     private final ScheduleRepository scheduleRepository;
-    private final AppointmentRepository appointmentRepository;
     private final AppointmentService appointmentService;
     private final CurrentUserProvider currentUserProvider;
     private final BusinessDateTimeResolver businessDateTimeResolver;
@@ -244,6 +244,10 @@ public class ConversationServiceImpl implements ConversationService {
             // flujo normal ya con el borrador limpio, sin arrastrar la propuesta vencida.
         }
 
+        if (state.getStage().isPendingOperationStage()) {
+            return respondToPendingOperation(business, message, state, existingCustomer);
+        }
+
         if (state.getStage() == ConversationStage.AWAITING_CONFIRMATION) {
             return respondToConfirmationStage(business, message, state, existingCustomer);
         }
@@ -308,10 +312,9 @@ public class ConversationServiceImpl implements ConversationService {
             if (existingCustomer.isEmpty()) {
                 return finish(state, business, NO_APPOINTMENT_FOUND_REPLY, parsed.intent(), parsed.confidence(), null);
             }
-            Long appointmentId = parsed.intent() == ConversationIntent.RESCHEDULE_APPOINTMENT
-                    ? handleReschedule(existingCustomer.get(), business, parsed)
-                    : handleCancel(existingCustomer.get(), business);
-            return finish(state, business, parsed.reply(), parsed.intent(), parsed.confidence(), appointmentId);
+            // Solo INICIA el flujo (identifica una cita propia y pide confirmación): ni el REPLY ni el
+            // APPOINTMENT_ID de la IA se usan, y no se modifica nada todavía.
+            return startAppointmentOperation(business, state, existingCustomer.get(), parsed);
         }
 
         String mergeFailure = mergeParsedIntoDraft(state, business, parsed, message);
@@ -962,55 +965,377 @@ public class ConversationServiceImpl implements ConversationService {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Reschedule / Cancel: sin cambios de comportamiento respecto de la versión anterior
+    // Cancelar / reprogramar una cita existente. Reglas de seguridad (GS-BOT-002):
+    //  - La identidad del cliente es SOLO el teléfono remitente del webhook (Customer resuelto en
+    //    route()); el APPOINTMENT_ID / nombre / teléfono que extraiga la IA se ignora por completo.
+    //  - Nunca se ejecuta por la sola intención: se identifica una cita PROPIA, se muestra, y se
+    //    exige un sí inequívoco (ConfirmationClassifier#isSimpleAffirmation) antes de escribir.
+    //  - Propiedad, estado y disponibilidad se revalidan en AppointmentService al ejecutar.
+    //  - La respuesta de éxito se redacta con el AppointmentResponse efectivamente persistido,
+    //    jamás con el REPLY de la IA.
+    //  - El estado vive en campos pending_operation_* y en etapas propias, separado del borrador
+    //    de reserva nueva.
     // ---------------------------------------------------------------------------------------
 
-    private Long handleReschedule(Customer customer, Business business, ParsedAiReply parsed) {
-        if (parsed.startAtText() == null) {
-            return null;
-        }
+    private static final int MAX_APPOINTMENT_OPTIONS = 5;
+    private static final String NO_UPCOMING_APPOINTMENT_REPLY =
+            "No encontré ninguna reserva futura para modificar.";
+    private static final String OPERATION_DISCARDED_REPLY =
+            "Sin problema, no hice ningún cambio en tu reserva. ¿En qué más puedo ayudarte?";
+    private static final String APPOINTMENT_NOT_MODIFIABLE_REPLY =
+            "Esa reserva ya no se puede modificar. No hice ningún cambio.";
+    private static final String OPERATION_FAILED_REPLY =
+            "No pude completar el cambio en este momento. Probá de nuevo en unos minutos.";
+    private static final String ASK_NEW_TIME_AGAIN_REPLY =
+            "¿Para cuándo querés moverla? Decime día y hora, por ejemplo \"mañana a las 15\", o \"no\" para dejarla como está.";
+    private static final String ASK_NEW_HOUR_REPLY = "¿A qué hora te gustaría?";
+    private static final String RESCHEDULE_SLOT_TAKEN_REPLY =
+            "Ese horario acaba de dejar de estar disponible. ¿Qué otro horario preferís?";
 
-        Long appointmentId = parsed.appointmentId() != null
-                ? parsed.appointmentId()
-                : findNextUpcomingAppointmentId(customer, business).orElse(null);
-
-        if (appointmentId == null) {
-            return null;
-        }
-
-        Long id = appointmentId;
-        return attempt(() -> {
-            Instant startAt = businessDateTimeResolver.resolve(parsed.startAtText(), business.getTimezone());
-            RescheduleAppointmentRequest rescheduleRequest = new RescheduleAppointmentRequest();
-            rescheduleRequest.setStartAt(startAt);
-            return appointmentService.reschedule(business.getId(), id, rescheduleRequest).getId();
-        });
+    private ConversationIntent intentOf(PendingOperation operation) {
+        return operation == PendingOperation.RESCHEDULE
+                ? ConversationIntent.RESCHEDULE_APPOINTMENT
+                : ConversationIntent.CANCEL_APPOINTMENT;
     }
 
-    private Long handleCancel(Customer customer, Business business) {
-        Long appointmentId = findNextUpcomingAppointmentId(customer, business).orElse(null);
-        if (appointmentId == null) {
-            return null;
+    /** Punto de entrada desde la intención de la IA: solo INICIA el flujo, nunca modifica una cita. */
+    private ConversationResponse startAppointmentOperation(Business business, ConversationState state,
+                                                           Customer customer, ParsedAiReply parsed) {
+        PendingOperation operation = parsed.intent() == ConversationIntent.RESCHEDULE_APPOINTMENT
+                ? PendingOperation.RESCHEDULE
+                : PendingOperation.CANCEL;
+        state.clearPendingOperation();
+        state.setPendingOperation(operation);
+        if (operation == PendingOperation.RESCHEDULE && parsed.startAtText() != null) {
+            // Solo una pista: se valida recién cuando haya una cita propia identificada. Si no
+            // se pudo interpretar, más adelante se vuelve a preguntar.
+            applyOperationStart(state, business, parsed.startAtText());
         }
-
-        Long id = appointmentId;
-        return attempt(() -> appointmentService.cancel(business.getId(), id).getId());
+        return presentOwnAppointments(business, state, customer, null);
     }
 
-    private Optional<Long> findNextUpcomingAppointmentId(Customer customer, Business business) {
-        Pageable pageable = PageRequest.of(0, 1, Sort.by(Sort.Direction.ASC, "startAt"));
-        Specification<Appointment> specification = AppointmentSpecifications.filterBy(
-                business.getId(), null, customer.getId(), AppointmentStatus.CONFIRMED, Instant.now(), null);
-        Page<Appointment> page = appointmentRepository.findAll(specification, pageable);
+    /** Lista las citas futuras PROPIAS y avanza según haya 0, 1 o varias. */
+    private ConversationResponse presentOwnAppointments(Business business, ConversationState state,
+                                                        Customer customer, String replyPrefix) {
+        PendingOperation operation = state.getPendingOperation();
+        List<AppointmentResponse> upcoming = appointmentService.findUpcomingForCustomer(
+                business.getId(), customer.getId(), MAX_APPOINTMENT_OPTIONS);
+        String prefix = replyPrefix != null ? replyPrefix + "\n\n" : "";
 
-        return page.getContent().stream().findFirst().map(Appointment::getId);
+        if (upcoming.isEmpty()) {
+            state.clearPendingOperation();
+            return finish(state, business, NO_UPCOMING_APPOINTMENT_REPLY, intentOf(operation),
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        if (upcoming.size() == 1) {
+            return proceedWithAppointment(business, state, customer, upcoming.get(0));
+        }
+        state.offerPendingOperationOptions(upcoming.stream().map(AppointmentResponse::getId).toList());
+        state.setPendingOperationAppointmentId(null);
+        state.setStage(ConversationStage.AWAITING_APPOINTMENT_CHOICE);
+        String verb = operation == PendingOperation.RESCHEDULE ? "reprogramar" : "cancelar";
+        return finish(state, business, prefix + replyFormatter.appointmentChoiceList(business, upcoming, verb),
+                intentOf(operation), DETERMINISTIC_CONFIDENCE, null);
     }
 
-    private Long attempt(java.util.function.Supplier<Long> action) {
+    private ConversationResponse proceedWithAppointment(Business business, ConversationState state,
+                                                        Customer customer, AppointmentResponse appointment) {
+        PendingOperation operation = state.getPendingOperation();
+        state.setPendingOperationAppointmentId(appointment.getId());
+        state.setPendingOperationOptions(null);
+
+        if (operation == PendingOperation.CANCEL) {
+            state.setStage(ConversationStage.AWAITING_CANCEL_CONFIRM);
+            return finish(state, business, replyFormatter.cancelQuestion(business, appointment),
+                    ConversationIntent.CANCEL_APPOINTMENT, DETERMINISTIC_CONFIDENCE, null);
+        }
+        if (state.getPendingOperationNewStartAt() != null) {
+            return proposeReschedule(business, state, customer, appointment);
+        }
+        state.setStage(ConversationStage.AWAITING_RESCHEDULE_TIME);
+        String ask = state.getPendingOperationNewDate() != null
+                ? ASK_NEW_HOUR_REPLY
+                : replyFormatter.askNewTime(business, appointment);
+        return finish(state, business, ask, ConversationIntent.RESCHEDULE_APPOINTMENT,
+                DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    private ConversationResponse respondToPendingOperation(Business business, String message, ConversationState state,
+                                                           Optional<Customer> customerOpt) {
+        if (customerOpt.isEmpty() || !state.hasPendingOperation()) {
+            state.clearPendingOperation();
+            return finish(state, business, NO_APPOINTMENT_FOUND_REPLY, ConversationIntent.UNKNOWN,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        Customer customer = customerOpt.get();
+        return switch (state.getStage()) {
+            case AWAITING_APPOINTMENT_CHOICE -> respondToAppointmentChoice(business, message, state, customer);
+            case AWAITING_CANCEL_CONFIRM -> respondToCancelConfirmation(business, message, state, customer);
+            case AWAITING_RESCHEDULE_TIME -> respondToRescheduleTime(business, message, state, customer);
+            case AWAITING_RESCHEDULE_CONFIRM -> respondToRescheduleConfirmation(business, message, state, customer);
+            default -> throw new IllegalStateException("Etapa sin operación pendiente: " + state.getStage());
+        };
+    }
+
+    private ConversationResponse discardOperation(Business business, ConversationState state) {
+        ConversationIntent intent = intentOf(state.getPendingOperation());
+        state.clearPendingOperation();
+        return finish(state, business, OPERATION_DISCARDED_REPLY, intent, DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    private ConversationResponse operationNotModifiable(Business business, ConversationState state) {
+        ConversationIntent intent = intentOf(state.getPendingOperation());
+        state.clearPendingOperation();
+        return finish(state, business, APPOINTMENT_NOT_MODIFIABLE_REPLY, intent, DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    // --- Elegir entre varias citas ------------------------------------------------------------
+
+    private ConversationResponse respondToAppointmentChoice(Business business, String message,
+                                                            ConversationState state, Customer customer) {
+        Matcher matcher = SERVICE_OPTION_NUMBER.matcher(message == null ? "" : message);
+        if (!matcher.matches()) {
+            if (confirmationClassifier.isSimpleNegation(message)) {
+                return discardOperation(business, state);
+            }
+            return presentOwnAppointments(business, state, customer,
+                    "Elegí una reserva respondiendo con su número (o \"no\" para dejarlo así).");
+        }
+        List<Long> options = state.pendingOperationOptionList();
+        int option = Integer.parseInt(matcher.group(1));
+        if (option < 1 || option > options.size()) {
+            return presentOwnAppointments(business, state, customer, "Esa opción no es válida.");
+        }
+        // Se revalida contra la base: debe seguir siendo del cliente y modificable.
+        Optional<AppointmentResponse> chosen = appointmentService.findModifiableForCustomer(
+                business.getId(), customer.getId(), options.get(option - 1));
+        if (chosen.isEmpty()) {
+            return presentOwnAppointments(business, state, customer, "Esa reserva ya no está disponible.");
+        }
+        return proceedWithAppointment(business, state, customer, chosen.get());
+    }
+
+    // --- Cancelación --------------------------------------------------------------------------
+
+    private ConversationResponse respondToCancelConfirmation(Business business, String message,
+                                                             ConversationState state, Customer customer) {
+        if (confirmationClassifier.isSimpleAffirmation(message)) {
+            return executeCancel(business, state, customer);
+        }
+        if (confirmationClassifier.isSimpleNegation(message)) {
+            return discardOperation(business, state);
+        }
+        // Ambiguo ("sí, pero...", "no, mejor...", cualquier otra cosa): no se ejecuta nada.
+        Optional<AppointmentResponse> appointment = appointmentService.findModifiableForCustomer(
+                business.getId(), customer.getId(), state.getPendingOperationAppointmentId());
+        if (appointment.isEmpty()) {
+            return operationNotModifiable(business, state);
+        }
+        return finish(state, business, "Todavía no cancelé nada. " + replyFormatter.cancelQuestion(
+                        business, appointment.get()), ConversationIntent.CANCEL_APPOINTMENT,
+                DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    private ConversationResponse executeCancel(Business business, ConversationState state, Customer customer) {
+        Long appointmentId = state.getPendingOperationAppointmentId();
         try {
-            return action.get();
+            AppointmentResponse cancelled = appointmentService.cancelForCustomer(
+                    business.getId(), customer.getId(), appointmentId);
+            if (cancelled == null || cancelled.getId() == null || cancelled.getStatus() != AppointmentStatus.CANCELLED) {
+                log.warn("cancelForCustomer devolvió un resultado no cancelado. businessId={}", business.getId());
+                return operationFailed(business, state);
+            }
+            log.info("Cita cancelada por el cliente tras confirmación. businessId={}, appointmentId={}",
+                    business.getId(), cancelled.getId());
+            state.clearPendingOperation();
+            return finish(state, business, replyFormatter.cancelDone(business, cancelled),
+                    ConversationIntent.CANCEL_APPOINTMENT, CONFIRMED_BOOKING_CONFIDENCE, cancelled.getId());
+        } catch (AppointmentNotFoundException | AppointmentNotModifiableException ex) {
+            return operationNotModifiable(business, state);
         } catch (RuntimeException ex) {
+            log.error("Error al cancelar una cita. businessId={}, exceptionType={}, exceptionMessage={}",
+                    business.getId(), ex.getClass().getSimpleName(), ex.getMessage());
+            return operationFailed(business, state);
+        }
+    }
+
+    private ConversationResponse operationFailed(Business business, ConversationState state) {
+        ConversationIntent intent = intentOf(state.getPendingOperation());
+        state.clearPendingOperation();
+        return finish(state, business, OPERATION_FAILED_REPLY, intent, DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    // --- Reprogramación -----------------------------------------------------------------------
+
+    private ConversationResponse respondToRescheduleTime(Business business, String message,
+                                                         ConversationState state, Customer customer) {
+        if (confirmationClassifier.isSimpleNegation(message)) {
+            return discardOperation(business, state);
+        }
+        return applyNewTimeFromMessage(business, message, state, customer);
+    }
+
+    /** Interpreta con la IA SOLO el horario pedido (START_AT) y lo valida con las reglas reales. */
+    private ConversationResponse applyNewTimeFromMessage(Business business, String message,
+                                                         ConversationState state, Customer customer) {
+        ParsedAiReply parsed = askAi(business, state, message);
+        if (parsed.startAtText() == null) {
+            return finish(state, business, ASK_NEW_TIME_AGAIN_REPLY, ConversationIntent.RESCHEDULE_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        String error = applyOperationStart(state, business, parsed.startAtText());
+        if (error != null) {
+            return finish(state, business, error, ConversationIntent.RESCHEDULE_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        if (state.getPendingOperationNewStartAt() == null) {
+            state.setStage(ConversationStage.AWAITING_RESCHEDULE_TIME);
+            return finish(state, business, ASK_NEW_HOUR_REPLY, ConversationIntent.RESCHEDULE_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        Optional<AppointmentResponse> appointment = appointmentService.findModifiableForCustomer(
+                business.getId(), customer.getId(), state.getPendingOperationAppointmentId());
+        if (appointment.isEmpty()) {
+            return operationNotModifiable(business, state);
+        }
+        return proposeReschedule(business, state, customer, appointment.get());
+    }
+
+    /** Comprueba disponibilidad real del nuevo horario y, si está libre, pide confirmación. */
+    private ConversationResponse proposeReschedule(Business business, ConversationState state,
+                                                   Customer customer, AppointmentResponse appointment) {
+        Instant newStart = state.getPendingOperationNewStartAt();
+        AvailabilityCheck check;
+        try {
+            check = appointmentService.checkRescheduleForCustomer(
+                    business.getId(), customer.getId(), appointment.getId(), newStart);
+        } catch (AppointmentNotFoundException | AppointmentNotModifiableException ex) {
+            return operationNotModifiable(business, state);
+        }
+        if (!check.available()) {
+            state.setPendingOperationNewStartAt(null);
+            state.setPendingOperationNewDate(null);
+            state.setStage(ConversationStage.AWAITING_RESCHEDULE_TIME);
+            AvailabilityReason reason = check.reason() != null ? check.reason() : AvailabilityReason.OVERLAPPING;
+            return finish(state, business, replyFormatter.rescheduleUnavailable(reason),
+                    ConversationIntent.RESCHEDULE_APPOINTMENT, DETERMINISTIC_CONFIDENCE, null);
+        }
+        state.setPendingOperationAppointmentId(appointment.getId());
+        state.setStage(ConversationStage.AWAITING_RESCHEDULE_CONFIRM);
+        return finish(state, business, replyFormatter.reschedulePrompt(business, appointment, newStart),
+                ConversationIntent.RESCHEDULE_APPOINTMENT, DETERMINISTIC_CONFIDENCE, null);
+    }
+
+    private ConversationResponse respondToRescheduleConfirmation(Business business, String message,
+                                                                 ConversationState state, Customer customer) {
+        if (confirmationClassifier.isSimpleAffirmation(message)) {
+            return executeReschedule(business, state, customer);
+        }
+        if (confirmationClassifier.isSimpleNegation(message)) {
+            return discardOperation(business, state);
+        }
+        // Cualquier otra cosa ("sí, pero a las 17", "no, mejor el viernes") es una modificación o
+        // una aclaración: la propuesta anterior NO se ejecuta. Se intenta leer el nuevo horario.
+        ParsedAiReply parsed = askAi(business, state, message);
+        if (parsed.startAtText() == null) {
+            Optional<AppointmentResponse> appointment = appointmentService.findModifiableForCustomer(
+                    business.getId(), customer.getId(), state.getPendingOperationAppointmentId());
+            if (appointment.isEmpty() || state.getPendingOperationNewStartAt() == null) {
+                return operationNotModifiable(business, state);
+            }
+            return finish(state, business, "Todavía no cambié nada. " + replyFormatter.reschedulePrompt(
+                            business, appointment.get(), state.getPendingOperationNewStartAt()),
+                    ConversationIntent.RESCHEDULE_APPOINTMENT, DETERMINISTIC_CONFIDENCE, null);
+        }
+        String error = applyOperationStart(state, business, parsed.startAtText());
+        if (error != null) {
+            return finish(state, business, error, ConversationIntent.RESCHEDULE_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        if (state.getPendingOperationNewStartAt() == null) {
+            state.setStage(ConversationStage.AWAITING_RESCHEDULE_TIME);
+            return finish(state, business, ASK_NEW_HOUR_REPLY, ConversationIntent.RESCHEDULE_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        }
+        Optional<AppointmentResponse> appointment = appointmentService.findModifiableForCustomer(
+                business.getId(), customer.getId(), state.getPendingOperationAppointmentId());
+        if (appointment.isEmpty()) {
+            return operationNotModifiable(business, state);
+        }
+        return proposeReschedule(business, state, customer, appointment.get());
+    }
+
+    private ConversationResponse executeReschedule(Business business, ConversationState state, Customer customer) {
+        Instant newStart = state.getPendingOperationNewStartAt();
+        Long appointmentId = state.getPendingOperationAppointmentId();
+        if (newStart == null || appointmentId == null) {
+            return operationNotModifiable(business, state);
+        }
+        try {
+            AppointmentResponse updated = appointmentService.rescheduleForCustomer(
+                    business.getId(), customer.getId(), appointmentId, newStart);
+            if (updated == null || updated.getId() == null || !newStart.equals(updated.getStartAt())) {
+                log.warn("rescheduleForCustomer devolvió un resultado inconsistente. businessId={}", business.getId());
+                return operationFailed(business, state);
+            }
+            log.info("Cita reprogramada por el cliente tras confirmación. businessId={}, appointmentId={}",
+                    business.getId(), updated.getId());
+            state.clearPendingOperation();
+            return finish(state, business, replyFormatter.rescheduleDone(business, updated),
+                    ConversationIntent.RESCHEDULE_APPOINTMENT, CONFIRMED_BOOKING_CONFIDENCE, updated.getId());
+        } catch (AppointmentNotFoundException | AppointmentNotModifiableException ex) {
+            return operationNotModifiable(business, state);
+        } catch (BusinessException ex) {
+            // Revalidación dura: el horario dejó de estar libre entre la propuesta y el "sí".
+            log.info("Revalidación al reprogramar rechazó el horario. businessId={}, exceptionMessage={}",
+                    business.getId(), ex.getMessage());
+            state.setPendingOperationNewStartAt(null);
+            state.setPendingOperationNewDate(null);
+            state.setStage(ConversationStage.AWAITING_RESCHEDULE_TIME);
+            return finish(state, business, RESCHEDULE_SLOT_TAKEN_REPLY, ConversationIntent.RESCHEDULE_APPOINTMENT,
+                    DETERMINISTIC_CONFIDENCE, null);
+        } catch (RuntimeException ex) {
+            log.error("Error al reprogramar una cita. businessId={}, exceptionType={}, exceptionMessage={}",
+                    business.getId(), ex.getClass().getSimpleName(), ex.getMessage());
+            return operationFailed(business, state);
+        }
+    }
+
+    /**
+     * Interpreta el texto de fecha/hora de la reprogramación sobre pending_operation_new_*, nunca
+     * sobre el borrador de reserva. Devuelve un mensaje de error para el cliente, o {@code null} si
+     * quedó resuelta una hora (newStartAt) o solo una fecha (newDate, falta la hora).
+     */
+    private String applyOperationStart(ConversationState state, Business business, String startAtText) {
+        String trimmed = startAtText.trim();
+        LocalDate knownDate = state.getPendingOperationNewDate();
+        if (knownDate == null && state.getPendingOperationNewStartAt() != null) {
+            knownDate = state.getPendingOperationNewStartAt().atZone(ZoneId.of(business.getTimezone())).toLocalDate();
+        }
+
+        if (knownDate != null && TIME_ONLY_EXPRESSION.matcher(trimmed).matches()) {
+            try {
+                state.setPendingOperationNewStartAt(
+                        businessDateTimeResolver.resolveTimeOnly(trimmed, knownDate, business.getTimezone()));
+                state.setPendingOperationNewDate(null);
+                return null;
+            } catch (AmbiguousTimeException ambiguous) {
+                return ambiguous.getMessage();
+            } catch (BusinessException ignored) {
+                // Se intenta la ruta completa (fecha + hora) abajo.
+            }
+        }
+
+        try {
+            state.setPendingOperationNewStartAt(businessDateTimeResolver.resolve(trimmed, business.getTimezone()));
+            state.setPendingOperationNewDate(null);
             return null;
+        } catch (MissingTimeException missingTime) {
+            state.setPendingOperationNewDate(missingTime.getResolvedDate());
+            state.setPendingOperationNewStartAt(null);
+            return null;
+        } catch (BusinessException ex) {
+            return ex.getMessage() != null ? ex.getMessage() : OPERATION_FAILED_REPLY;
         }
     }
 

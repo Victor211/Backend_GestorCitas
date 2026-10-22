@@ -111,6 +111,60 @@ public class ConversationReplyFormatter {
                 + " a las " + LOCAL_TIME_FORMATTER.format(localStart) + ".";
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Cancelación / reprogramación de una cita existente. Todo se redacta a partir del
+    // AppointmentResponse real (nunca del REPLY de la IA); los textos de éxito solo se usan con la
+    // respuesta ya persistida.
+    // ---------------------------------------------------------------------------------------
+
+    private String describeAppointment(Business business, AppointmentResponse appointment) {
+        ZonedDateTime local = appointment.getStartAt().atZone(ZoneId.of(business.getTimezone()));
+        return appointment.getServiceName() + " con " + appointment.getEmployeeName() + " "
+                + describeDate(local) + " a las " + LOCAL_TIME_FORMATTER.format(local);
+    }
+
+    public String appointmentChoiceList(Business business, List<AppointmentResponse> appointments, String verb) {
+        String lines = IntStream.range(0, appointments.size())
+                .mapToObj(i -> (i + 1) + ". " + describeAppointment(business, appointments.get(i)))
+                .collect(Collectors.joining("\n"));
+        return "Tenés varias reservas próximas:\n\n" + lines + "\n\n¿Cuál querés " + verb
+                + "? Respondé con el número.";
+    }
+
+    public String cancelQuestion(Business business, AppointmentResponse appointment) {
+        return "Encontré tu reserva de " + describeAppointment(business, appointment)
+                + ". ¿Querés cancelarla? Respondé sí o no.";
+    }
+
+    public String cancelDone(Business business, AppointmentResponse cancelled) {
+        return "✅ Listo, cancelé tu reserva de " + describeAppointment(business, cancelled) + ".";
+    }
+
+    public String askNewTime(Business business, AppointmentResponse appointment) {
+        return "Tu reserva es de " + describeAppointment(business, appointment)
+                + ". ¿Para cuándo querés moverla? Decime día y hora, por ejemplo \"mañana a las 15\".";
+    }
+
+    public String reschedulePrompt(Business business, AppointmentResponse original, Instant newStartAt) {
+        ZonedDateTime newLocal = newStartAt.atZone(ZoneId.of(business.getTimezone()));
+        return "Tu reserva es de " + describeAppointment(business, original) + ". ¿Querés pasarla a "
+                + describeDate(newLocal) + " a las " + LOCAL_TIME_FORMATTER.format(newLocal)
+                + "? Respondé sí o no.";
+    }
+
+    public String rescheduleDone(Business business, AppointmentResponse updated) {
+        return "✅ Listo, reprogramé tu reserva: " + describeAppointment(business, updated) + ".";
+    }
+
+    public String rescheduleUnavailable(AvailabilityReason reason) {
+        return switch (reason) {
+            case OVERLAPPING -> "Ese horario ya está ocupado. ¿Qué otro horario preferís?";
+            case OUTSIDE_SCHEDULE -> "Ese horario está fuera del horario de atención. ¿Qué otro preferís?";
+            case IN_PAST -> "Esa hora ya pasó. ¿Qué otro horario preferís?";
+            default -> "No hay disponibilidad para ese horario. ¿Qué otro preferís?";
+        };
+    }
+
     public String multipleEmployeesReply(Business business, List<Employee> candidates, Instant startAt) {
         ZonedDateTime local = startAt.atZone(ZoneId.of(business.getTimezone()));
         String names = joinWithAnd(candidates.stream().map(this::employeeDisplayName).toList());

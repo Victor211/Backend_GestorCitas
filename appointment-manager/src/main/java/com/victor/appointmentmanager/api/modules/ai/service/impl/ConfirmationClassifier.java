@@ -53,6 +53,44 @@ public class ConfirmationClassifier {
         return ConfirmationSignal.UNRECOGNIZED;
     }
 
+    /** Palabras que, SOLAS, forman una afirmación simple ("sí", "dale, confirmo", "está bien"). */
+    private static final Set<String> SIMPLE_AFFIRMATION_TOKENS = Set.of(
+            "si", "sii", "dale", "ok", "okey", "okay", "confirmo", "confirmado", "correcto", "claro",
+            "perfecto", "de", "acuerdo", "esta", "bien", "por", "favor", "listo", "gracias");
+    private static final Set<String> SIMPLE_NEGATION_TOKENS = Set.of(
+            "no", "nop", "nope", "mejor", "gracias", "olvidalo", "dejalo", "dejemos", "asi", "esta", "bien");
+
+    /**
+     * {@code true} solo si el mensaje ENTERO es una afirmación simple. A diferencia de {@link
+     * #classify}, que detecta una palabra clave en cualquier parte del mensaje, acá cualquier
+     * palabra extra ("sí, pero a las 17", "confirmo aunque prefiero mañana") lo descarta: esos
+     * mensajes modifican o condicionan la propuesta y nunca deben ejecutarla. Se usa para
+     * cancelar/reprogramar citas existentes, donde una confirmación equivocada es irreversible.
+     */
+    public boolean isSimpleAffirmation(String message) {
+        List<String> tokens = tokensOf(message);
+        if (tokens.isEmpty() || !SIMPLE_AFFIRMATION_TOKENS.containsAll(tokens)) {
+            return false;
+        }
+        String normalized = String.join(" ", tokens);
+        return tokens.stream().anyMatch(POSITIVE_WORDS::contains) || POSITIVE_PHRASES.contains(normalized);
+    }
+
+    /** {@code true} solo si el mensaje entero es un rechazo simple ("no", "mejor no", "no gracias"). */
+    public boolean isSimpleNegation(String message) {
+        List<String> tokens = tokensOf(message);
+        return !tokens.isEmpty()
+                && SIMPLE_NEGATION_TOKENS.containsAll(tokens)
+                && tokens.stream().anyMatch(token -> token.equals("no") || token.equals("nop")
+                        || token.equals("nope") || token.equals("olvidalo") || token.equals("dejalo")
+                        || token.equals("dejemos"));
+    }
+
+    private List<String> tokensOf(String message) {
+        String normalized = normalize(message);
+        return normalized.isEmpty() ? List.of() : List.of(MULTI_SPACE.split(normalized));
+    }
+
     private boolean containsAny(String normalized, List<String> phrases) {
         return phrases.stream().anyMatch(normalized::contains);
     }

@@ -9,6 +9,7 @@ import com.victor.appointmentmanager.api.modules.appointments.dto.response.Appoi
 import com.victor.appointmentmanager.api.modules.appointments.entity.Appointment;
 import com.victor.appointmentmanager.api.modules.appointments.enums.AppointmentStatus;
 import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotFoundException;
+import com.victor.appointmentmanager.api.modules.appointments.exception.AppointmentNotModifiableException;
 import com.victor.appointmentmanager.api.modules.appointments.mapper.AppointmentMapper;
 import com.victor.appointmentmanager.api.modules.appointments.repository.AppointmentRepository;
 import com.victor.appointmentmanager.api.modules.appointments.service.AvailabilityCheck;
@@ -1040,6 +1041,125 @@ class AppointmentServiceImplTest {
         List<Instant> slots = appointmentService.findAvailableSlots(1L, 3L, 4L, futureMonday, 3);
 
         assertThat(slots).hasSize(3);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // GS-BOT-002: operaciones del cliente (propiedad verificada en la capa de servicio)
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void cancelForCustomerCancelsOwnAppointment() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        when(appointmentRepository.findOwnedForUpdate(100L, 1L, 2L)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.save(appointment)).thenReturn(appointment);
+        AppointmentResponse dto = new AppointmentResponse();
+        when(appointmentMapper.toDto(appointment)).thenReturn(dto);
+
+        AppointmentResponse result = appointmentService.cancelForCustomer(1L, 2L, 100L);
+
+        assertThat(result).isSameAs(dto);
+        assertThat(appointment.getStatus()).isEqualTo(AppointmentStatus.CANCELLED);
+    }
+
+    @Test
+    void cancelForCustomerRejectsAppointmentOfAnotherCustomerWithoutRevealingIt() {
+        // La cita 100 existe, pero el cliente 99 no es su dueño: la consulta filtrada no la devuelve.
+        when(appointmentRepository.findOwnedForUpdate(100L, 1L, 99L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> appointmentService.cancelForCustomer(1L, 99L, 100L))
+                .isInstanceOf(AppointmentNotFoundException.class);
+
+        verify(appointmentRepository, never()).save(any());
+    }
+
+    @Test
+    void cancelForCustomerRejectsAlreadyCancelledCompletedAndPastAppointments() {
+        for (AppointmentStatus status : List.of(AppointmentStatus.CANCELLED, AppointmentStatus.COMPLETED,
+                AppointmentStatus.NO_SHOW)) {
+            Appointment appointment = existingAppointment(status);
+            when(appointmentRepository.findOwnedForUpdate(100L, 1L, 2L)).thenReturn(Optional.of(appointment));
+            assertThatThrownBy(() -> appointmentService.cancelForCustomer(1L, 2L, 100L))
+                    .isInstanceOf(AppointmentNotModifiableException.class);
+        }
+
+        Appointment past = existingAppointment(AppointmentStatus.CONFIRMED);
+        past.setStartAt(Instant.now().minusSeconds(3600));
+        when(appointmentRepository.findOwnedForUpdate(100L, 1L, 2L)).thenReturn(Optional.of(past));
+        assertThatThrownBy(() -> appointmentService.cancelForCustomer(1L, 2L, 100L))
+                .isInstanceOf(AppointmentNotModifiableException.class);
+
+        verify(appointmentRepository, never()).save(any());
+    }
+
+    @Test
+    void rescheduleForCustomerRejectsAppointmentOfAnotherCustomer() {
+        when(appointmentRepository.findOwnedForUpdate(100L, 1L, 99L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> appointmentService.rescheduleForCustomer(1L, 99L, 100L, startAt.plusSeconds(3600)))
+                .isInstanceOf(AppointmentNotFoundException.class);
+
+        verify(appointmentRepository, never()).save(any());
+    }
+
+    @Test
+    void rescheduleForCustomerMovesOwnAppointmentWhenSlotIsFree() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Instant newStart = startAt.plusSeconds(3600);
+        when(appointmentRepository.findOwnedForUpdate(100L, 1L, 2L)).thenReturn(Optional.of(appointment));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(3L, newStart, newStart.plusSeconds(1800), 100L,
+                AppointmentStatus.CANCELLED)).thenReturn(false);
+        when(appointmentRepository.save(appointment)).thenReturn(appointment);
+        when(appointmentMapper.toDto(appointment)).thenReturn(new AppointmentResponse());
+
+        appointmentService.rescheduleForCustomer(1L, 2L, 100L, newStart);
+
+        assertThat(appointment.getStartAt()).isEqualTo(newStart);
+        assertThat(appointment.getEndAt()).isEqualTo(newStart.plusSeconds(1800));
+    }
+
+    @Test
+    void rescheduleForCustomerRevalidatesAvailabilityAndLeavesAppointmentUntouchedWhenBusy() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Instant newStart = startAt.plusSeconds(3600);
+        when(appointmentRepository.findOwnedForUpdate(100L, 1L, 2L)).thenReturn(Optional.of(appointment));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(3L, newStart, newStart.plusSeconds(1800), 100L,
+                AppointmentStatus.CANCELLED)).thenReturn(true);
+
+        assertThatThrownBy(() -> appointmentService.rescheduleForCustomer(1L, 2L, 100L, newStart))
+                .isInstanceOf(BusinessException.class);
+
+        assertThat(appointment.getStartAt()).isEqualTo(startAt);
+        verify(appointmentRepository, never()).save(any());
+    }
+
+    @Test
+    void checkRescheduleForCustomerIgnoresTheAppointmentItselfWhenLookingForOverlaps() {
+        Appointment appointment = existingAppointment(AppointmentStatus.CONFIRMED);
+        Instant newStart = startAt.plusSeconds(900);
+        when(appointmentRepository.findByIdAndBusinessIdAndCustomerId(100L, 1L, 2L))
+                .thenReturn(Optional.of(appointment));
+        when(scheduleRepository.findByEmployeeIdAndDayOfWeekAndActiveTrueOrderByStartTimeAsc(3L, DayOfWeek.MONDAY))
+                .thenReturn(List.of(schedule));
+        when(appointmentRepository.existsOverlapping(3L, newStart, newStart.plusSeconds(1800), 100L,
+                AppointmentStatus.CANCELLED)).thenReturn(false);
+
+        AvailabilityCheck check = appointmentService.checkRescheduleForCustomer(1L, 2L, 100L, newStart);
+
+        assertThat(check.available()).isTrue();
+    }
+
+    @Test
+    void findModifiableForCustomerHidesNonModifiableAndForeignAppointments() {
+        when(appointmentRepository.findByIdAndBusinessIdAndCustomerId(100L, 1L, 2L))
+                .thenReturn(Optional.of(existingAppointment(AppointmentStatus.COMPLETED)));
+        when(appointmentRepository.findByIdAndBusinessIdAndCustomerId(100L, 1L, 99L)).thenReturn(Optional.empty());
+
+        assertThat(appointmentService.findModifiableForCustomer(1L, 2L, 100L)).isEmpty();
+        assertThat(appointmentService.findModifiableForCustomer(1L, 99L, 100L)).isEmpty();
     }
 
     private Appointment existingAppointment(AppointmentStatus status) {
